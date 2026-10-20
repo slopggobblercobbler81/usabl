@@ -9,7 +9,7 @@ import { loadAliasConfig } from './alias-config.js';
 import { buildUnresolvedReason } from './discovery-diagnostics.js';
 import { buildImportGraph, inspectDirectImports } from './import-graph.js';
 import { parseRouteManifest, type RouteEntry, type RouteManifest } from './route-manifest.js';
-import { parseDocsManifest } from './docs-manifest.js';
+import { parseDocsManifest, type DocsManifest } from './docs-manifest.js';
 import { assertSurfaceIds } from '../intake/surface-ids.js';
 import { configError } from '../intake/config-error.js';
 import { matchGlob } from '../primitives/match-glob.js';
@@ -135,19 +135,16 @@ function importClosure(graph: { get(file: string): string[] }, entryFile: string
   return seen;
 }
 
-export async function computeCoverage(fs: FsGlob, config: UsablConfig, changedFiles: string[]): Promise<Coverage> {
-  // affectedByScreen below is keyed by surface id, so a blank or repeated id silently drops a
-  // screen while its changed files still read as mapped. Config parsing refuses that document,
-  // but this planner takes a UsablConfig value from any caller, so it checks the invariant it
-  // depends on rather than trusting that every caller parsed first. Refusing is honest here:
-  // the run fails open and discloses, which is what an unscannable config deserves.
+export async function computeCoverage(
+  fs: FsGlob,
+  config: UsablConfig,
+  changedFiles: string[],
+  preloadedDocsManifest?: DocsManifest | null,
+): Promise<Coverage> {
   assertSurfaceIds(config.surfaces);
 
-  // Identity is checked before the idle return, not after. A run where no app UI file changed can
-  // still scan docs pages, and a floor entry keyed by an id shared with an app screen absorbs a
-  // docs finding whether or not this planner found anything to do.
   const manifest = await parseRouteManifest(fs, config.discovery);
-  const docsManifest = await parseDocsManifest(fs);
+  const docsManifest = preloadedDocsManifest !== undefined ? preloadedDocsManifest : await parseDocsManifest(fs);
   assertScreenIdsAreUnambiguous(config, manifest, (docsManifest?.pages ?? []).map((page) => page.pageId));
 
   const uiFiles = changedFiles.filter(

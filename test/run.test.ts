@@ -450,4 +450,16 @@ describe('run', () => {
     expect(r.findings.filter((f) => f.status === 'fixed')).toHaveLength(1);
     expect(r.paidDownCount).toBe(1);
   });
+
+  it('surfaces loadRequirements failure reason as a coverage gap', async () => {
+    const deps = makeFakeDeps({
+      ...guardOk,
+      files: {
+        'usabl.config.json': JSON.stringify({ ...config, requirements: 'requirements' }),
+      },
+      changed: [{ code: 'M', path: 'fixtures/app/src/ClustersPage.tsx' }],
+    });
+    const r = await run(deps, { ...config, requirements: 'requirements' });
+    expect(r.coverage.gaps.some((g) => g.reason.includes('requirements directory had no yaml files'))).toBe(true);
+  });
 });

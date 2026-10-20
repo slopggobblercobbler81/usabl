@@ -111,8 +111,8 @@ export async function run(deps: Deps, config: UsablConfig, opts: RunOptions = {}
     const scanConfigResolution = await scanConfigForCoverage(deps, config, guardDivergedPaths, opts.trustedRef);
     const scanConfig = scanConfigResolution.config;
     const coverageFs = overlayUntrustedManifests(deps, guardDivergedPaths, opts.trustedRef);
-    const discoveredCoverage = await computeCoverage(coverageFs, scanConfig, changed);
     const docsManifest = await parseDocsManifest(coverageFs);
+    const discoveredCoverage = await computeCoverage(coverageFs, scanConfig, changed, docsManifest);
     const docsCoverage = computeDocsCoverage(docsManifest, changed);
     const affected = [...discoveredCoverage.affected, ...docsCoverage.affected];
     // Idle means nothing UI-touching changed. A run whose scan configuration could not be read
@@ -126,6 +126,13 @@ export async function run(deps: Deps, config: UsablConfig, opts: RunOptions = {}
       docsCoverage.nothingToCheck;
     const intakeFs = overlayRequirementsFs(deps.fs, deps.git, scanConfig, opts.trustedRef);
     const loadedRequirements = await loadRequirements(intakeFs, scanConfig);
+    const requirementsGap: CoverageGap | null = loadedRequirements.ok
+      ? null
+      : {
+          ref: loadedRequirements.path ?? config.requirements ?? 'requirements',
+          state: 'not-covered',
+          reason: loadedRequirements.reason,
+        };
     const intakePolicyPaths =
       loadedRequirements.ok
         ? []
@@ -172,9 +179,8 @@ export async function run(deps: Deps, config: UsablConfig, opts: RunOptions = {}
       nothingToCheck,
       unresolvedFiles: [...discoveredCoverage.unresolvedFiles, ...docsCoverage.unresolvedFiles],
       gaps: [
-        // First, so the surfaces that name one example per gap state name this one. It explains
-        // why no app screen appears on this run. Docs screens can still appear below it.
         ...(scanConfigResolution.unreadable === null ? [] : [scanConfigResolution.unreadable]),
+        ...(requirementsGap === null ? [] : [requirementsGap]),
         ...discoveredCoverage.gaps,
         ...docsCoverage.gaps,
         ...screens.flatMap((screen) => screen.gaps),
