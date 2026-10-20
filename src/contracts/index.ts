@@ -149,6 +149,14 @@ export interface ScreenScan {
   // English. Optional and only meaningful when reachedSelectorPresent is false. Absent or null when
   // the surface declared no selector.
   reachedWhenSelector?: string | null;
+  // The response half of the readiness signal, measured at the same moment as the selector. The
+  // same tri-state: absent or null when the surface declared no response, true when a fetch or XHR
+  // request to the declared path on the application's own host answered with a 2xx status, false
+  // when no such answer was seen. Only false triggers an unseen gap in markUnseenScreens.
+  reachedResponseSeen?: boolean | null;
+  // The response path the surface declared, carried so a coverage gap can name it. Absent or null
+  // when the surface declared no response.
+  reachedWhenResponse?: string | null;
 }
 
 // ---- coverage ----
@@ -386,6 +394,18 @@ export interface AxNode {
 export interface ElementRef {
   selector: string;
 }
+// One answer to a fetch or XHR request the page made, as the network tracker recorded it.
+export interface ApiResponse {
+  url: string;
+  status: number;
+  // The Content-Type header the answer carried, as sent, or null when it carried none. An HTML
+  // answer is a page, such as a sign-in page or a history fallback, not the data that was asked for.
+  contentType: string | null;
+  // Whether the request was sent before Page.markWalkStart, so before usabl pressed a key or ran a
+  // check. Its answer can arrive later. True for every request until the mark is set. A request the
+  // tracker never saw sent reads as false once the mark is set, because nothing dates it.
+  sentBeforeWalk: boolean;
+}
 export interface Page {
   gotoReady(): Promise<void>;
   // Where the browser actually is now, which is not always where it was sent. An application can
@@ -393,6 +413,16 @@ export interface Page {
   // it measured a different page. Read it after the screen has loaded and before anything on the
   // page is exercised, because providers click and press keys and a click can navigate.
   currentUrl(): Promise<string>;
+  // Every response to the page's own data requests (fetch and XHR) since navigation, in arrival
+  // order, with its status. This is what lets a refused request be read against what came after
+  // it, and what a declared readiness response is looked up in. Documents and assets are left
+  // out, because an authentication wall answers 200 to those too. Empty means no data response was
+  // seen, which is not proof that none was sent: one still in flight at the read is not here.
+  apiResponses(): Promise<ApiResponse[]>;
+  // Marks the moment before the keyboard walk begins. A data request sent after it was caused by
+  // usabl or arrived during the checks, so it never counts toward the screen's readiness response.
+  // A request sent before it counts whenever its answer arrives. Only the first call sets the mark.
+  markWalkStart(): Promise<void>;
   // URLs of the page's own data requests (fetch and XHR) that came back 401 between navigation and
   // the moment this is read. A single page application that stays at the requested address and
   // swaps in a login form leaves no trace in the URL and may not have rendered the form yet, so
@@ -471,21 +501,35 @@ export interface NoiseBudgetConfig {
   perSurface?: Record<string, number>;
 }
 
+// The object form of a surface's readiness signal. At least one part is declared.
+export interface ReachedWhenSignal {
+  // A CSS selector that must match at least one element in the rendered page. The string form of
+  // reachedWhen is shorthand for this part alone.
+  selector?: string;
+  // A URL path, such as "/api/users". It holds when a fetch or XHR request the page made to the
+  // application's own host (the appBaseUrl hostname or a subdomain of it, any scheme or port)
+  // answered with a 2xx status, and the request path is this path or continues it after a slash.
+  // The query string is not compared. A document or asset response never counts.
+  response?: string;
+}
+
 export interface SurfaceConfig {
   id: string;
   url: string;
   files: string[];
-  // Optional positive reachability assertion: a CSS selector that must match at least one element
-  // once the screen has loaded and the walk has run. If it is absent from the rendered DOM, the
-  // screen is marked unseen and its findings are dropped. Absent means the body-only floor is the
-  // only unseen detector for this surface. When present it must be a non-empty string.
+  // Optional readiness signal: positive evidence that this screen really rendered. Either a CSS
+  // selector string, or an object with a selector, a response path, or both. Every declared part
+  // has to hold once the screen has loaded and the walk has run. If one does not, the screen is
+  // marked unseen and its findings are dropped. Absent means the body-only floor and the session
+  // rules are the only unseen detectors for this surface. See ReachedWhenSignal for each part.
   //
-  // A matched selector also overrides the password-field rule in providers/redirected.ts, so what
-  // it names matters. This is operator-supplied policy, not independent proof: a selector aimed at
-  // a persistent application shell, a header, a navigation, or a footer is present on a login wall
+  // A signal that holds also overrides the password-field rule in providers/redirected.ts, and it
+  // is what lets a refused request the application recovered from stand, so what it names
+  // matters. This is operator-supplied policy, not independent proof: a selector aimed at a
+  // persistent application shell, a header, a navigation, or a footer is present on a login wall
   // too, and it will let a wrong page through. Name content only this screen has, such as that
-  // screen's own table, heading, or empty state.
-  reachedWhen?: string;
+  // screen's own table, heading, or empty state, or a data request only this screen makes.
+  reachedWhen?: string | ReachedWhenSignal;
   // Declares that this surface is the same screen as the discovered route with the same id, and
   // exists to control that screen's scan URL. Surface ids and route screen ids are one namespace,
   // so without this the planner cannot tell an intended URL override from two different screens

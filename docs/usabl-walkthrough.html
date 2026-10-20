@@ -1810,14 +1810,15 @@ kbd {
 
   <h3>Seeing a screen is proved, never assumed</h3>
 
-  <p>After scanning, <code>markUnseenScreens</code> runs two independent detectors on each screen.</p>
+  <p>After scanning, <code>markUnseenScreens</code> runs independent detectors on each screen.</p>
 
   <ul>
     <li><strong>Body only.</strong> The keyboard walk recorded stops, but every single stop was the document body. A page that renders nothing still tabs to the body.</li>
     <li><strong>Declared selector absent.</strong> The screen config declared a <code>reachedWhen</code> selector as proof of load, and it is not in the DOM.</li>
+    <li><strong>Declared response absent.</strong> The screen config declared a <code>reachedWhen</code> response path as proof of load, and no data request to that path on the application's own host was answered with a success.</li>
   </ul>
 
-  <p>The two detectors are deliberately independent. A matched <code>reachedWhen</code> never cancels the body-only detector, because a selector aimed at a persistent application shell matches on the login wall too. If either fires, the screen's findings and applicability data are stripped and a gap is raised. Reachability rests on positive evidence that the screen loaded, never on the absence of a difference between screens.</p>
+  <p>The detectors are deliberately independent. A matched <code>reachedWhen</code> never cancels the body-only detector, because a selector aimed at a persistent application shell matches on the login wall too. If either fires, the screen's findings and applicability data are stripped and a gap is raised. Reachability rests on positive evidence that the screen loaded, never on the absence of a difference between screens.</p>
 
   <div class="note">
     <span class="label">Signed-in scanning</span>

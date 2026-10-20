@@ -3,7 +3,7 @@
  * This unit validates shape only.
  * It must never mint a verdict or choose scan targets on its own.
  */
-import type { SurfaceConfig, UsablConfig } from '../contracts/index.js';
+import type { ReachedWhenSignal, SurfaceConfig, UsablConfig } from '../contracts/index.js';
 import { assertSurfaceIds } from './surface-ids.js';
 import { configError } from './config-error.js';
 import { expandBraces } from '../primitives/match-glob.js';
@@ -68,25 +68,107 @@ function expectPositiveWholeNumber(value: unknown, label: string): number {
   return value;
 }
 
-// An empty reachedWhen would match nothing and mark every scan of the surface unseen, which is a
+// The readiness signal a surface declares: positive evidence that the screen really rendered. Two
+// shapes are accepted. A string is a CSS selector on its own, which is the shape every earlier
+// config uses. An object names a selector, a response path, or both, and every part it names has to
+// hold for the screen to count as seen.
+//
+// An empty selector would match nothing and mark every scan of the surface unseen, which is a
 // silent failure hiding as coverage loss. Refuse it at config load so the operator fixes it before
 // a run.
 //
-// What the selector should name cannot be checked here, and it matters. A matched reachedWhen is
+// What the selector should name cannot be checked here, and it matters. A signal that holds is
 // read as the operator asserting this screen rendered, and it overrides the password-field rule
 // that would otherwise flag a sign-in page. It is policy, not proof: a selector aimed at a
 // persistent application shell, a header, a navigation, or a footer is present on a login wall
 // too, so it would pass the wrong page. The refusal message says so, because config load is the
 // last place an operator reads anything about this field.
-function parseReachedWhen(raw: unknown, index: number): string | undefined {
+//
+// The advice is written into each message rather than interpolated, because configError caps
+// every interpolated value at a short length and would cut it off.
+const REACHED_WHEN_KEYS = new Set(['selector', 'response']);
+
+function parseSelector(raw: unknown, label: string): string {
+  if (typeof raw !== 'string' || raw.trim().length === 0) {
+    throw configError`${label} must be a non-empty CSS selector naming content only this screen has, such as its own table or heading. A shell, header, navigation, or footer selector matches a sign-in page too and would let a wrong page pass as this screen.`;
+  }
+  return raw;
+}
+
+// The response part is a path on the application, matched against the page's own data requests to
+// the appBaseUrl host. It is refused unless it is a plain absolute path, because every other shape
+// either cannot match what the matcher compares or matches far too much:
+//
+//   - a full URL or a "//host" address names a host, and the host is always the application's;
+//   - a query or a fragment is never compared, so writing one would read as a filter that is not
+//     applied;
+//   - whitespace and control characters cannot appear in a request path as sent, and URL parsing
+//     strips a trailing control character;
+//   - a backslash is read as a slash by URL parsing, and a "." or ".." segment, plain or
+//     percent-encoded, is resolved away by it, so the path compared is not the path written;
+//   - "/" alone, or anything that parses to it, is answered by every data request on the host,
+//     including a sign-in wall's own, so it proves nothing about this screen.
+//
+// The message never repeats the value, because a value that parses differently from how it reads
+// is exactly what an operator cannot judge from a quote of it.
+const DOT_SEGMENT = /^(?:\.|%2e){1,2}$/i;
+
+function isPlainResponsePath(raw: string): boolean {
+  if (
+    !raw.startsWith('/') ||
+    raw.startsWith('//') ||
+    raw.includes('?') ||
+    raw.includes('#') ||
+    raw.includes('\\') ||
+    /\s/.test(raw) ||
+    /[\u0000-\u001f\u007f]/.test(raw)
+  ) {
+    return false;
+  }
+  if (raw.split('/').some((segment) => DOT_SEGMENT.test(segment))) {
+    return false;
+  }
+  try {
+    return new URL(raw, 'http://usabl.invalid').pathname !== '/';
+  } catch {
+    return false;
+  }
+}
+
+function parseResponsePath(raw: unknown, label: string): string {
+  if (typeof raw !== 'string' || !isPlainResponsePath(raw)) {
+    throw configError`${label} must be a path on the application that only this screen requests, such as "/api/users". It starts with one slash, is not the root, and has no host, query, fragment, spaces, control characters, backslashes, or dot segments.`;
+  }
+  return raw;
+}
+
+function parseReachedWhen(raw: unknown, index: number): string | ReachedWhenSignal | undefined {
   if (raw === undefined) {
     return undefined;
   }
-  const selector = expectString(raw, `surfaces[${index}].reachedWhen`);
-  if (selector.trim().length === 0) {
-    throw configError`surfaces[${index}].reachedWhen must be a non-empty CSS selector naming content only this screen has, such as its own table or heading. A shell, header, navigation, or footer selector matches a sign-in page too and would let a wrong page pass as this screen.`;
+  const label = `surfaces[${index}].reachedWhen`;
+  if (typeof raw === 'string') {
+    return parseSelector(raw, label);
   }
-  return selector;
+  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) {
+    throw configError`${label} must be a CSS selector string, or an object with a selector, a response, or both`;
+  }
+  // A misspelled key would drop that part of the signal without a word, and the screen would be
+  // judged on less evidence than the operator wrote down. Refuse it.
+  for (const key of Object.keys(raw)) {
+    if (!REACHED_WHEN_KEYS.has(key)) {
+      throw configError`${label} has an unknown key "${key}". The keys it accepts are selector and response.`;
+    }
+  }
+  const selectorRaw = Reflect.get(raw, 'selector');
+  const responseRaw = Reflect.get(raw, 'response');
+  if (selectorRaw === undefined && responseRaw === undefined) {
+    throw configError`${label} must declare a selector, a response, or both`;
+  }
+  return {
+    ...(selectorRaw === undefined ? {} : { selector: parseSelector(selectorRaw, `${label}.selector`) }),
+    ...(responseRaw === undefined ? {} : { response: parseResponsePath(responseRaw, `${label}.response`) }),
+  };
 }
 
 // A surface id and a discovered route screen id are one namespace. This declaration is how an

@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Orders</title>
+  </head>
+  <body>
+    <main>
+      <h1>Orders</h1>
+      <!--
+        A development server with a history fallback, or a sign-in proxy, answers every address it
+        does not know with this page and a 200. The page's call for its own data gets this HTML
+        back, not the data.
+      -->
+      <button id="retry" type="button">Retry</button>
+    </main>
+    <script>
+      fetch('/spa/api/orders').catch(() => undefined);
+    </script>
+  </body>
+</html>

@@ -2,11 +2,12 @@ import { createServer } from 'node:http';
 import { readFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
-import type { Provider } from '../../src/contracts/index.js';
+import type { Provider, SurfaceConfig } from '../../src/contracts/index.js';
 import { buildDeps } from '../../src/deps/build.js';
 import { makeRealBrowserDriver } from '../../src/deps/real.js';
 import { axeProvider } from '../../src/providers/axe/index.js';
 import { makeCheckRunner } from '../../src/providers/check-runner.js';
+import { markUnseenScreens } from '../../src/coverage/unseen.js';
 import { makeStepRunner } from '../../src/providers/keyboard-walk/steps.js';
 import { testConfig } from '../helpers.js';
 
@@ -34,6 +35,22 @@ interface FixtureServer {
   lateUnauthorizedUrl: string;
   // Focusing its first control mounts a tooltip that fades out over a few hundred milliseconds.
   tooltipOnFocusUrl: string;
+  // Three sign-in pages the session rules cannot see, each served at the address the scan asked
+  // for: a passkey prompt, a magic-link form, and an authentication wall that answers 200 to every
+  // request under it.
+  passkeySignInUrl: string;
+  magicLinkUrl: string;
+  authWallUrl: string;
+  // The real screen: it fetches /api/data/orders and renders table#orders from the answer.
+  ordersUrl: string;
+  // The same screen, whose identity call is refused once and answered after a token refresh.
+  ordersRecoveredUrl: string;
+  // A screen whose call for its own data is answered 200 with an HTML page, the way a dev server
+  // history fallback or a sign-in proxy answers it.
+  spaFallbackUrl: string;
+  // A page that asks for no data on load and requests the screen's data path only when a control
+  // is focused, so the only answer to that path is one the walk caused.
+  fetchOnFocusUrl: string;
   close: () => Promise<void>;
 }
 
@@ -52,7 +69,16 @@ async function makeFixtureServer(): Promise<FixtureServer> {
     '/shadow-sign-in.html': await readFixture('shadow-sign-in.html'),
     '/late-unauthorized.html': await readFixture('late-unauthorized.html'),
     '/tooltip-on-focus.html': await readFixture('tooltip-on-focus.html'),
+    '/passkey-sign-in.html': await readFixture('passkey-sign-in.html'),
+    '/magic-link.html': await readFixture('magic-link.html'),
+    '/orders.html': await readFixture('orders-screen.html'),
+    '/fetch-on-focus.html': await readFixture('fetch-on-focus.html'),
   };
+  const spaFallback = await readFixture('spa-fallback.html');
+  const authWall = await readFixture('auth-wall.html');
+  // Addresses under /api/once/ already answered once. Each is refused the first time and answered
+  // every time after, which is what a server does for a call made just before a token refresh.
+  const answeredOnce = new Set<string>();
 
   const server = createServer((req, res) => {
     const reqUrl = new URL(req.url ?? '/', 'http://127.0.0.1');
@@ -81,6 +107,37 @@ async function makeFixtureServer(): Promise<FixtureServer> {
     if (reqUrl.pathname.startsWith('/api/forbidden/')) {
       res.writeHead(403, { 'content-type': 'application/json; charset=utf-8' });
       res.end('{"detail":"You do not have permission."}');
+      return;
+    }
+    // The screen's own data, answered for a working session.
+    if (reqUrl.pathname.startsWith('/api/data/')) {
+      res.writeHead(200, { 'content-type': 'application/json; charset=utf-8' });
+      res.end('["A-100","A-101"]');
+      return;
+    }
+    if (reqUrl.pathname.startsWith('/api/once/')) {
+      const key = `${reqUrl.pathname}${reqUrl.search}`;
+      if (!answeredOnce.has(key)) {
+        answeredOnce.add(key);
+        res.writeHead(401, { 'content-type': 'application/json; charset=utf-8' });
+        res.end('{"detail":"Token expired."}');
+        return;
+      }
+      res.writeHead(200, { 'content-type': 'application/json; charset=utf-8' });
+      res.end('{"user":"operator"}');
+      return;
+    }
+    // A history fallback: every address under it, the data call included, answers 200 with the
+    // same HTML page.
+    if (reqUrl.pathname.startsWith('/spa/')) {
+      res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+      res.end(spaFallback);
+      return;
+    }
+    // An authentication wall: every address under it answers 200 with the same landing page.
+    if (reqUrl.pathname.startsWith('/wall/')) {
+      res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+      res.end(authWall);
       return;
     }
     // An ordinary redirect that still ends on the screen that was asked for.
@@ -138,6 +195,13 @@ async function makeFixtureServer(): Promise<FixtureServer> {
     forbiddenApiUrl: `http://127.0.0.1:${address.port}/expired-session-app.html?api=/api/forbidden`,
     lateUnauthorizedUrl: `http://127.0.0.1:${address.port}/late-unauthorized.html`,
     tooltipOnFocusUrl: `http://127.0.0.1:${address.port}/tooltip-on-focus.html`,
+    passkeySignInUrl: `http://127.0.0.1:${address.port}/passkey-sign-in.html`,
+    magicLinkUrl: `http://127.0.0.1:${address.port}/magic-link.html`,
+    authWallUrl: `http://127.0.0.1:${address.port}/wall/orders`,
+    ordersUrl: `http://127.0.0.1:${address.port}/orders.html`,
+    ordersRecoveredUrl: `http://127.0.0.1:${address.port}/orders.html?recover=1`,
+    spaFallbackUrl: `http://127.0.0.1:${address.port}/spa/orders`,
+    fetchOnFocusUrl: `http://127.0.0.1:${address.port}/fetch-on-focus.html`,
     close: async () =>
       new Promise<void>((resolve, reject) => {
         // The hang route leaves a socket open, and server.close() waits for it forever.
@@ -638,6 +702,107 @@ describe.skipIf(process.env.USABL_INTEGRATION !== '1')('real browser driver inte
     } finally {
       await deps.browser.close();
     }
+  });
+
+  describe('a declared readiness signal, through a real browser', () => {
+    // One helper for every case: a real Chromium scan of one address under a configured session,
+    // with a provider that reports a barrier on whatever page it is given, then the unseen pass
+    // run() applies. A screen that is not seen ends with no drafts and a not-covered gap.
+    async function scanWithSignal(
+      url: string,
+      reachedWhen: SurfaceConfig['reachedWhen'],
+    ): Promise<{ unseen: boolean; drafts: number; gaps: string[] }> {
+      const runner = makeCheckRunner({
+        browser: driver,
+        providers: [alwaysFiringProvider('orders')],
+        config: testConfig({
+          appBaseUrl: fixture.url,
+          surfaces: [
+            { id: 'orders', url, files: [], ...(reachedWhen === undefined ? {} : { reachedWhen }) },
+          ],
+        }),
+        allowedCapabilities: ['live'],
+        stepRunner: makeStepRunner(),
+        transcriptTabCap: 5,
+        sessionConfigured: true,
+      });
+      const pass = markUnseenScreens([await runner.scan({ id: 'orders', url })]);
+      const screen = pass.screens[0];
+      return {
+        unseen: pass.unseenScreenIds.includes('orders'),
+        drafts: screen?.drafts.length ?? 0,
+        gaps: (screen?.gaps ?? []).map((gap) => gap.reason),
+      };
+    }
+
+    const signInPages: Array<[string, () => string]> = [
+      ['a passkey sign-in page', () => fixture.passkeySignInUrl],
+      ['a magic-link page', () => fixture.magicLinkUrl],
+      ['an authentication wall that answers 200', () => fixture.authWallUrl],
+    ];
+
+    for (const [name, urlOf] of signInPages) {
+      it(`gaps ${name} when the screen declares a selector`, async () => {
+        const result = await scanWithSignal(urlOf(), 'table#orders');
+        expect(result.unseen).toBe(true);
+        expect(result.drafts).toBe(0);
+        expect(result.gaps.some((reason) => reason.includes('table#orders'))).toBe(true);
+      }, 30_000);
+
+      it(`gaps ${name} when the screen declares a response`, async () => {
+        const result = await scanWithSignal(urlOf(), { response: '/api/data/orders' });
+        expect(result.unseen).toBe(true);
+        expect(result.drafts).toBe(0);
+        expect(result.gaps.some((reason) => reason.includes('/api/data/orders'))).toBe(true);
+      }, 30_000);
+    }
+
+    it('still scores a passkey sign-in page as the screen when no signal is declared', async () => {
+      // The documented limit. Nothing here tells the page apart from the screen.
+      const result = await scanWithSignal(fixture.passkeySignInUrl, undefined);
+      expect(result.unseen).toBe(false);
+      expect(result.gaps).toEqual([]);
+      expect(result.drafts).toBe(1);
+    }, 30_000);
+
+    it('measures the real screen when both parts of its signal hold', async () => {
+      const result = await scanWithSignal(fixture.ordersUrl, {
+        selector: 'table#orders',
+        response: '/api/data/orders',
+      });
+      expect(result.unseen).toBe(false);
+      expect(result.gaps).toEqual([]);
+      expect(result.drafts).toBe(1);
+    }, 30_000);
+
+    it('measures a screen whose refused identity call was answered after a token refresh', async () => {
+      const result = await scanWithSignal(fixture.ordersRecoveredUrl, {
+        selector: 'table#orders',
+        response: '/api/data/orders',
+      });
+      expect(result.gaps).toEqual([]);
+      expect(result.drafts).toBe(1);
+    }, 30_000);
+
+    it('gaps a screen whose data call was answered 200 with an HTML page', async () => {
+      const result = await scanWithSignal(fixture.spaFallbackUrl, { response: '/spa/api/orders' });
+      expect(result.unseen).toBe(true);
+      expect(result.drafts).toBe(0);
+      expect(result.gaps.some((reason) => reason.includes('/spa/api/orders'))).toBe(true);
+    }, 30_000);
+
+    it('gaps a page whose only answer to the data path came from a request the walk caused', async () => {
+      const result = await scanWithSignal(fixture.fetchOnFocusUrl, { response: '/api/data/orders' });
+      expect(result.unseen).toBe(true);
+      expect(result.drafts).toBe(0);
+      expect(result.gaps.some((reason) => reason.includes('/api/data/orders'))).toBe(true);
+    }, 30_000);
+
+    it('still gaps that screen on the refusal when it declares no signal', async () => {
+      const result = await scanWithSignal(fixture.ordersRecoveredUrl, undefined);
+      expect(result.drafts).toBe(0);
+      expect(result.gaps.some((reason) => reason.includes('401'))).toBe(true);
+    }, 30_000);
   });
 
   it('returns null for ignored or missing AX nodes', async () => {

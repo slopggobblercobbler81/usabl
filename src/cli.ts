@@ -18,6 +18,7 @@ import { run } from './run.js';
 import type { UsablConfig } from './contracts/index.js';
 import { buildDeps } from './deps/build.js';
 import { makeFsGlob } from './deps/fs.js';
+import { readStorageStateEnv } from './deps/session.js';
 import { formatInitReport, inferInit, writeInitDrafts, type InitFs } from './init/index.js';
 import {
   formatDocsInitReport,
@@ -316,7 +317,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
       // Init throws when a derived screen id is one the parser would refuse. A draft without
       // that route would hide it from coverage, so the refusal surfaces as an error and nothing
       // is written, the same way docs init refuses.
-      draft = await inferInit(initFs);
+      draft = await inferInit(initFs, { sessionConfigured: readStorageStateEnv(process.env) !== null });
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       process.stderr.write(`usabl: ${message}\n`);

@@ -20,7 +20,7 @@ import type {
   UsablConfig,
 } from '../contracts/index.js';
 import { attachDomSourceToDrafts } from './dom-source.js';
-import { measureReachability } from './reachability.js';
+import { measureReadiness, readApiResponses, readinessSignalOf, type ReadinessSignal } from './reachability.js';
 import { observeLanding, readRefusedRequests, redirectedAwayGap } from './redirected.js';
 import { waitForScannerArtifactsToClear } from './scanner-artifacts.js';
 import { runProviders } from './index.js';
@@ -78,7 +78,7 @@ function failedScan(screen: { id: string; url: string }, reason: string): Screen
 function notReachedScan(
   screen: { id: string; url: string },
   gap: CoverageGap,
-  reachedWhen: string | undefined,
+  signal: ReadinessSignal | null,
 ): ScreenScan {
   return {
     screenId: screen.id,
@@ -88,8 +88,23 @@ function notReachedScan(
     gaps: [gap],
     applicability: [],
     reachedSelectorPresent: null,
-    reachedWhenSelector: reachedWhen ?? null,
+    reachedWhenSelector: signal?.selector ?? null,
+    ...responseFields(signal, null),
   };
+}
+
+/**
+ * The response half of the readiness record. Left off entirely when the surface declared no
+ * response, so a scan of a surface that does not use it has exactly the shape it always had.
+ */
+function responseFields(
+  signal: ReadinessSignal | null,
+  seen: boolean | null,
+): Pick<ScreenScan, 'reachedResponseSeen' | 'reachedWhenResponse'> {
+  if (signal === null || signal.response === null) {
+    return {};
+  }
+  return { reachedResponseSeen: seen, reachedWhenResponse: signal.response };
 }
 
 function makeTabSteps(tabCap: number): Step[] {
@@ -120,10 +135,11 @@ export function makeCheckRunner(deps: CheckRunnerDeps): CheckRunner {
         return failedScan(screen, `screen failed to open: ${errorMessage(err)}`);
       }
 
-      // Look up the surface's optional reachedWhen selector by screen id. Only manually declared
+      // Look up the surface's optional readiness signal by screen id. Only manually declared
       // surfaces set an id that matches a scan target, so route-discovered screens find nothing here
       // and make no reachability claim.
       const reachedWhen = deps.config.surfaces.find((surface) => surface.id === screen.id)?.reachedWhen;
+      const signal = readinessSignalOf(reachedWhen);
 
       let result: ScreenScan = {
         screenId: screen.id,
@@ -133,7 +149,8 @@ export function makeCheckRunner(deps: CheckRunnerDeps): CheckRunner {
         gaps: [],
         applicability: [],
         reachedSelectorPresent: null,
-        reachedWhenSelector: reachedWhen ?? null,
+        reachedWhenSelector: signal?.selector ?? null,
+        ...responseFields(signal, null),
       };
       try {
         await page.gotoReady();
@@ -155,8 +172,11 @@ export function makeCheckRunner(deps: CheckRunnerDeps): CheckRunner {
           // about the requested screen, they are evidence about a different page, and collecting
           // them at all invites a later change to keep them. Nothing is claimed about
           // reachability either, because this page is not the one the assertion describes.
-          result = notReachedScan(screen, notReached, reachedWhen);
+          result = notReachedScan(screen, notReached, signal);
         } else {
+          // Everything the page sent up to here is the screen loading. Everything after is usabl
+          // pressing keys and running checks, so it never counts toward the readiness response.
+          await page.markWalkStart();
           await page.armAnnouncementCapture();
 
           const transcript = await deps.stepRunner.run(page, tabSteps);
@@ -174,10 +194,13 @@ export function makeCheckRunner(deps: CheckRunnerDeps): CheckRunner {
           );
           const drafts = await attachDomSourceToDrafts(page, providerResult.drafts);
 
-          // Measure reachability after the walk and providers have run, while the page is still
-          // open. This is the only place the live DOM exists; markUnseenScreens runs later over
-          // collected scans and cannot query the page.
-          const reachedSelectorPresent = await measureReachability(page, reachedWhen);
+          // Measure the readiness signal after the walk and providers have run, while the page is
+          // still open. This is the only place the live page exists; markUnseenScreens runs later
+          // over collected scans and cannot query it. Both parts are read at this one moment. The
+          // response part counts only requests sent before the walk began, so a request the page
+          // sent on load and the server answered slowly counts, and one a key press or a provider
+          // caused does not. The selector part sees the page as the checks left it.
+          const readiness = await measureReadiness(page, signal, deps.config.appBaseUrl);
 
           // Rule A again, on the record as it stands now. Readiness settles about 1.5 seconds
           // after a stable shell appears, so an application that sends its identity request later
@@ -186,12 +209,20 @@ export function makeCheckRunner(deps: CheckRunnerDeps): CheckRunner {
           // This is the second and last read: a refusal that arrives after it is not seen. Only
           // the refused-request record is re-read; the address and the password count keep their
           // load-time values for the reason given above.
+          //
+          // The response record is re-read with it, so a refusal the application recovered from
+          // during the walk is read against its later answer. Recovery also needs the declared
+          // response to have been answered at an address that was never refused, by a request sent
+          // before the walk; see recoveryStandsDown in redirected.ts. The selector part keeps its
+          // load-time value, and the later measurement above still has to hold on its own for the
+          // screen to count as seen.
           const lateRefusal = redirectedAwayGap(screen.id, {
             ...landing,
             unauthorizedApiUrls: await readRefusedRequests(page),
+            apiResponses: await readApiResponses(page),
           });
           if (lateRefusal !== null) {
-            result = notReachedScan(screen, lateRefusal, reachedWhen);
+            result = notReachedScan(screen, lateRefusal, signal);
           } else {
             result = {
               screenId: screen.id,
@@ -200,8 +231,9 @@ export function makeCheckRunner(deps: CheckRunnerDeps): CheckRunner {
               drafts,
               gaps: providerResult.gaps,
               applicability: providerResult.applicability,
-              reachedSelectorPresent,
-              reachedWhenSelector: reachedWhen ?? null,
+              reachedSelectorPresent: readiness.selectorPresent,
+              reachedWhenSelector: signal?.selector ?? null,
+              ...responseFields(signal, readiness.responseSeen),
             };
           }
         }

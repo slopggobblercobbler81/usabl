@@ -866,7 +866,30 @@ set the gate is given, so no floored barrier on it can be reported as resolved.
   fetching its identity endpoint at three seconds recorded nothing at the first read. The second read deliberately includes traffic the
   providers caused, because a request a provider click triggered is still the application answering
   this session. 401 only; 403 means authenticated and not permitted, which a correct signed-in scan
-  can legitimately meet. Nothing overrides this rule.
+  can legitimately meet.
+
+  One thing stands a refusal down, a token refresh, and it takes all of these together:
+
+  - The screen's readiness signal (below) declares a `response` path. A selector on its own, which
+    is what the string form of `reachedWhen` is, never stands Rule A down. That is the behaviour
+    from before recovery was read at all.
+  - That path was answered with a 2xx that is not an HTML page, by a request sent before the walk
+    began, at an address that was never refused in this record.
+  - A declared selector did not fail when the page settled.
+  - The last answer the page recorded for each refused address was a 2xx that is not an HTML page.
+
+  The address is compared without its fragment and with its query, so a retry with a different
+  query does not count, and a success on a different address, such as the refresh call itself,
+  never recovers a refusal. No one fact is enough. A 401 followed by a 200 can be an application
+  that dropped its stale token and was answered as an anonymous visitor. The "never refused" part
+  stops one 200 from doing two jobs: a wall that refuses `/api/users?page=1` and then answers the
+  anonymous retry of that same address would otherwise hold a `/api/users` signal and recover the
+  refusal with the same answer. So on a screen with no response path, a refusal followed by a
+  success is still a gap, exactly as before.
+
+  What this still cannot catch: an application that answers an anonymous visitor with a 2xx, not
+  HTML, both on the refused address and on the declared data path. To usabl that reads the same as
+  a token refresh. Pick a response path that only a signed-in session can get a success from.
 
   The host match. A refused request counts when its hostname equals the `appBaseUrl` hostname, or
   ends with a dot followed by it, regardless of scheme and port. So `api.example.com` counts for
@@ -879,9 +902,9 @@ set the gate is given, so no floored barrier on it can be reported as resolved.
   back a verdict.
 - **Rule B, a password field anywhere.** A storage state is configured and a password input exists
   anywhere in the page, in any frame or inside an open shadow root. The address is not consulted.
-  Overridden by `reachedWhen`: when the surface declares that selector and it is present at the
-  time of the check, this rule does not fire. A change-password screen, or a settings page with a
-  re-authentication prompt, is exactly the case the override exists for.
+  Overridden by `reachedWhen`: when the surface declares a readiness signal and every part of it
+  holds at the time of the check, this rule does not fire. A change-password screen, or a settings
+  page with a re-authentication prompt, is exactly the case the override exists for.
 - **Rule C, redirected to a sign-in page.** The browser ended on a different address than the one
   requested and that page carries a password input. This applies whether or not a storage state was
   configured, because a redirect to a sign-in page is the wrong page either way.
@@ -903,27 +926,112 @@ about this field.
 
 That is also why the override does not extend to Rule A. A same-host 401 with a configured session
 is the application itself saying the session was refused, which is stronger evidence than any
-selector an operator wrote.
+selector an operator wrote. Only the application later answering that same address stands it down,
+and only with the signal held.
 
-**What is still not caught.** A server-rendered sign-in page that makes no API calls and carries no
-password input: a passkey prompt, a magic-link page, an email-first identity provider, or a consent
-screen. An authentication wall that answers 200 to every request and renders a branded landing
-page. A sign-in wall whose API lives on an unrelated hostname. A sign-in page served at the very
-address that was requested, with no storage state configured. A 401 that arrives after the second
-read, which is the last observation of the page before it is closed, so a response still in flight
-at that moment is never recorded. And any screen whose `reachedWhen` selector matches a sign-in
-page, per the paragraph above. The body-only detector catches the subset of these that render
-nothing focusable; the rest stay open. The hole is narrower, not closed.
+**The readiness signal.** `reachedWhen` on a surface is positive evidence that the screen really
+rendered. It is general: it answers "did this screen render", not "is the session alive", so it
+applies with or without a configured storage state. It takes one of two shapes:
+
+```json
+"reachedWhen": "table#users"
+```
+
+```json
+"reachedWhen": { "selector": "table#users", "response": "/api/users" }
+```
+
+The string is a CSS selector on its own. The object declares a `selector`, a `response`, or both,
+and every part it declares has to hold.
+
+- `selector` holds when it matches at least one element in the rendered page. A selector the
+  browser rejects matches nothing, so it does not hold.
+- `response` is a URL path. It holds when one of the page's own `fetch` or XHR requests to the
+  application's own host answered with a status from 200 to 299, and the request path is that path
+  or continues it after a slash. The host match is the one Rule A uses: the `appBaseUrl` hostname
+  or a subdomain of it, on any scheme and port. The query string is never compared. So `/api/users`
+  holds for `/api/users?page=2` and `/api/users/42`, and not for `/api/users-archive`. A document,
+  stylesheet, image, font, or script response never counts, because an authentication wall answers
+  200 to those too. When `appBaseUrl` cannot be read, nothing counts. The config loader refuses a
+  `response` that does not start with one slash, that starts with two, that is `/` alone (every
+  data request on the host would satisfy it), or that carries a query, a fragment, whitespace, a
+  control character, a backslash, or a `.` or `..` segment, plain or percent-encoded. URL parsing
+  reads a backslash as a slash, resolves dot segments, and strips a trailing control character, so
+  each of those is compared as a different path from the one written, and most of them as `/`. It
+  also refuses any path that URL parsing turns into `/`. The message does not repeat the value. It
+  refuses an unknown key in the object, so a misspelled part is not silently dropped.
+- Two more things decide whether an answer counts toward `response`. An answer whose
+  `Content-Type` is `text/html` or `application/xhtml+xml`, with any parameters and in any case,
+  never counts: a sign-in page, an SSO or proxy login, and a development server's history
+  fallback all answer a data call with an HTML page and a 200. An API that really answers with
+  HTML therefore never satisfies the signal, and the screen becomes a gap, which is the safe
+  direction. An answer with no `Content-Type` counts. And only a request sent before the walk
+  began counts. usabl marks that moment just before the first key press, and an answer that
+  arrives later still counts when its request was sent before the mark, because a slow answer is
+  what the two reads exist for. A redirected request is dated by the request that started the
+  chain.
+
+Both parts are measured once, after the walk and the checks, while the page is still open. The
+selector part sees the page as the checks left it. The response part counts only requests sent
+before the walk began, so traffic a key press or a check caused never counts. A part
+that does not hold marks the screen unseen: its findings and applicability are dropped and it gets a
+`not-covered` gap that names the selector or the path. The same signal, measured when the page
+settles and before usabl touches it, is what overrides Rule B and what lets a recovered refusal
+stand under Rule A.
+
+`usabl init` recommends a signal for every surface it drafts when the application looks
+login-gated: when `USABL_STORAGE_STATE` is set while init runs, or when a discovered route has a
+sign-in path segment such as `login`, `sign-in`, `logout`, `auth`, or `sso`. It writes none itself,
+because only the operator knows what each screen shows, and a guessed selector that a sign-in page
+also matches would read as proof.
+
+**What the signal catches.** Measured through a real browser against three sign-in pages served at
+the address the scan asked for: a passkey prompt with one button, a magic-link form, and an
+authentication wall that answers 200 to every request under it, including its own status call.
+None makes a refused request and none has a password field, so the three rules say nothing, and
+each has a real control to focus, so the body-only floor says nothing either. Each is scored as the
+screen when the surface declares no signal. Each is a gap when the surface declares a selector for
+the screen's own table, and each is a gap when it declares the screen's own data path, because
+none of them renders that table or asks for that data. The same signal holds on the real screen.
+
+**What is still not caught.** Without a signal: a server-rendered sign-in page that makes no API
+calls and carries no password input (a passkey prompt, a magic-link page, an email-first identity
+provider, a consent screen); an authentication wall that answers 200 to every request and renders a
+branded landing page; a password field inside a closed shadow root or a cross-origin frame; a
+sign-in wall whose API lives on an unrelated hostname; a sign-in page served at the very address
+that was requested, with no storage state configured. The body-only detector catches only the
+subset of these that render nothing focusable.
+
+With a signal, these remain:
+
+- A selector that a sign-in page also matches, per the paragraph above.
+- A `response` the wall itself satisfies. If the application shell is public and runs its own
+  script, its request for the screen's data reaches the wall, and a wall that answers that request
+  with a 200 that is not HTML, such as an empty JSON body, satisfies the path. A wall is caught
+  when its own page does not request the declared path, or when it answers that path with an HTML
+  page. Pair the path with a selector for content that only real data renders.
+- Content a check caused. The selector part is read after the walk and the checks, so content a
+  provider click opened counts toward it. Traffic a check caused does not count toward the
+  response part.
+- A 401 that arrives after the second read, which is the last observation of the page before it
+  is closed, so a response still in flight at that moment is never recorded.
 
 A miss leaves exactly the behaviour that was there before, so none of this manufactures a new false
 green of its own. Each rule can also fire on a screen that was genuinely reached: a same-host
 endpoint that answers 401 where it means 403, every page-initiated 401 when `appBaseUrl` cannot be
-parsed, a signed-in screen with a password field and no `reachedWhen`, a stale configured URL. The cost of that is a coverage gap, so the run reports
-`not_covered` rather than a verdict it should not have minted.
+parsed, a refusal the application recovered from on a screen with no `response` path, a signed-in screen
+with a password field and no signal that holds, a stale configured URL. A signal that does not hold
+on a genuinely reached screen is a gap too: a selector for content that loads after the walk, a
+`response` path whose data comes from a host that is neither the `appBaseUrl` hostname nor a
+subdomain of it, which never counts, a `response` path an API answers with HTML, or one the page
+requests only after the walk began, such as a poll. The cost of each is a coverage gap, so the run reports `not_covered` rather than a verdict it
+should not have minted.
 
-What an operator can do. Declare `reachedWhen` on the surface, naming content only that screen has.
-It is the answer both for a screen these heuristics miss and for a screen Rule B fires on wrongly,
-and it is only as good as the selector: see the paragraph above on what a shell selector costs.
+What an operator can do. Declare `reachedWhen` on the surface, naming content only that screen has,
+a data request only that screen makes, or both. It is the answer for a screen these heuristics miss,
+for a screen Rule B fires on wrongly, and for a screen whose identity call is refused once before a
+token refresh. It is only as good as what it names: see the paragraphs above on what a shell
+selector and a public shell cost.
 
 #### A credential in a configured surface URL is echoed everywhere
 
@@ -1998,6 +2106,11 @@ change need `"overridesDiscoveredRoute": true` added to their surfaces.
 `ALWAYS_GUARDED` whether or not they are listed here, and the requirements directory is
 added when `requirements` is set. Listing rule modules, the gate, the trust code, and the
 gate workflow puts them under the same `approval_required` review.
+
+`surfaces[].reachedWhen` is optional. It is the screen's readiness signal: a CSS selector string,
+or an object with a `selector`, a `response` path, or both, every one of which has to hold for the
+screen to count as seen. See "Limits of detecting that a screen was not reached signed in" in
+section 8 for exactly when each part holds, what the loader refuses, and what it does not prove.
 
 `readyTimeoutMs` is optional and defaults to 60000. It is the whole budget for one screen
 to navigate, for its network to go quiet, and for its DOM to stop changing. How long that

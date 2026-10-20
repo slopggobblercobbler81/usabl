@@ -172,6 +172,60 @@ export const router = createBrowserRouter([{ path: '/only', element: <Page /> }]
   });
 });
 
+describe('inferInit readiness signal recommendation for a login-gated application', () => {
+  const loginRouter = `import { Route, Routes } from 'react-router-dom'
+import { Overview } from './pages/Overview'
+import { Clusters } from './pages/Clusters'
+import { SignIn } from './pages/SignIn'
+
+export function App() {
+  return (
+    <Routes>
+      <Route path="/" element={<Overview />} />
+      <Route path="/clusters" element={<Clusters />} />
+      <Route path="/sign-in" element={<SignIn />} />
+    </Routes>
+  )
+}
+`;
+
+  const recommendationsIn = (notes: string[]): string[] => notes.filter((note) => note.includes('reachedWhen'));
+
+  it('recommends a readiness signal for every screen when the run is configured with a session', async () => {
+    const draft = await inferInit(memoryFs(fixtureFiles()), { sessionConfigured: true });
+    const notes = recommendationsIn(draft.notes);
+    for (const id of ['root', 'clusters']) {
+      expect(notes.some((note) => note.includes(`"${id}"`))).toBe(true);
+    }
+    expect(notes.some((note) => note.includes('USABL_STORAGE_STATE'))).toBe(true);
+  });
+
+  it('recommends a readiness signal for every screen when the router has a sign-in route', async () => {
+    const fs = memoryFs(
+      fixtureFiles({
+        'src/App.tsx': loginRouter,
+        'src/pages/SignIn.tsx': 'export function SignIn() { return null }\n',
+      }),
+    );
+    const draft = await inferInit(fs);
+    const notes = recommendationsIn(draft.notes);
+    for (const id of ['root', 'clusters', 'sign-in']) {
+      expect(notes.some((note) => note.includes(`"${id}"`))).toBe(true);
+    }
+    expect(notes.some((note) => note.includes('/sign-in'))).toBe(true);
+  });
+
+  it('says nothing about a readiness signal when nothing suggests a login', async () => {
+    const draft = await inferInit(memoryFs(fixtureFiles()), { sessionConfigured: false });
+    expect(recommendationsIn(draft.notes)).toEqual([]);
+  });
+
+  it('writes no readiness signal itself, because only the operator knows what the screen shows', async () => {
+    const draft = await inferInit(memoryFs(fixtureFiles()), { sessionConfigured: true });
+    expect(draft.config.surfaces.every((surface) => surface.reachedWhen === undefined)).toBe(true);
+  });
+});
+
 describe('writeInitDrafts', () => {
   it('refuses to overwrite existing policy files without force', async () => {
     const fs = memoryFs(fixtureFiles({ 'usabl.config.json': '{}', 'usabl.routes.json': '{"routes":[]}' }));

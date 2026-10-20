@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import type {
+  ApiResponse,
   AxNode,
   Draft,
   Page,
@@ -320,6 +321,106 @@ describe('makeCheckRunner', () => {
 
     expect(scan.reachedSelectorPresent).toBe(false);
     expect(scan.reachedWhenSelector).toBe('main#app-root');
+  });
+
+  it('records whether a declared readiness response arrived, and names it', async () => {
+    for (const [responses, seen] of [
+      [[{ url: 'http://127.0.0.1:5173/api/clusters', status: 200, contentType: 'application/json', sentBeforeWalk: true }], true],
+      [[{ url: 'http://127.0.0.1:5173/api/clusters', status: 401, contentType: 'application/json', sentBeforeWalk: true }], false],
+      [[], false],
+    ] as const) {
+      const page = await makeScriptedPage({ activePaths: ['#first', '#first'], activeNodes: [null, null] });
+      Object.assign(page, { apiResponses: async () => responses });
+      const runner = makeCheckRunner({
+        browser: { open: async () => page, close: async () => {} },
+        providers: [],
+        config: testConfig({
+          appBaseUrl: 'http://127.0.0.1:5173',
+          surfaces: [{ id: SCREEN.id, url: SCREEN.url, files: [], reachedWhen: { response: '/api/clusters' } }],
+        }),
+        allowedCapabilities: ['live'],
+        stepRunner: makeStepRunner(),
+      });
+
+      const scan = await runner.scan(SCREEN);
+
+      expect(scan.reachedResponseSeen).toBe(seen);
+      expect(scan.reachedWhenResponse).toBe('/api/clusters');
+      // No selector was declared, so no selector claim is made.
+      expect(scan.reachedSelectorPresent).toBeNull();
+    }
+  });
+
+  it('does not count a declared response that a check caused, only traffic sent before the walk', async () => {
+    // A page with no data responses at load, where a provider's run then fires the declared path
+    // and is answered 200. That request is usabl's doing, not the screen loading.
+    const page = await makeScriptedPage({ activePaths: ['#first', '#first'], activeNodes: [null, null] });
+    let walkStarted = false;
+    const responses: ApiResponse[] = [];
+    Object.assign(page, {
+      markWalkStart: async () => {
+        walkStarted = true;
+      },
+      apiResponses: async () => responses.map((response) => ({ ...response })),
+    });
+    const clickingProvider: Provider = {
+      id: 'clicks-something',
+      layer: 'fake',
+      capabilities: ['live'],
+      run: async (): Promise<Draft[]> => {
+        responses.push({
+          url: 'http://127.0.0.1:5173/api/clusters',
+          status: 200,
+          contentType: 'application/json',
+          sentBeforeWalk: !walkStarted,
+        });
+        return [];
+      },
+    };
+    const runner = makeCheckRunner({
+      browser: { open: async () => page, close: async () => {} },
+      providers: [clickingProvider],
+      config: testConfig({
+        appBaseUrl: 'http://127.0.0.1:5173',
+        surfaces: [{ id: SCREEN.id, url: SCREEN.url, files: [], reachedWhen: { response: '/api/clusters' } }],
+      }),
+      allowedCapabilities: ['live'],
+      stepRunner: makeStepRunner(),
+    });
+
+    const scan = await runner.scan(SCREEN);
+
+    expect(walkStarted).toBe(true);
+    expect(scan.reachedResponseSeen).toBe(false);
+  });
+
+  it('still counts a declared response the page sent on load and that was answered during the walk', async () => {
+    // The slow answer the second read exists for: not in the record at load, in it afterwards.
+    const page = await makeScriptedPage({ activePaths: ['#first', '#first'], activeNodes: [null, null] });
+    let reads = 0;
+    Object.assign(page, {
+      markWalkStart: async () => {},
+      apiResponses: async () => {
+        reads += 1;
+        return reads === 1
+          ? []
+          : [{ url: 'http://127.0.0.1:5173/api/clusters', status: 200, contentType: 'application/json', sentBeforeWalk: true }];
+      },
+    });
+    const runner = makeCheckRunner({
+      browser: { open: async () => page, close: async () => {} },
+      providers: [],
+      config: testConfig({
+        appBaseUrl: 'http://127.0.0.1:5173',
+        surfaces: [{ id: SCREEN.id, url: SCREEN.url, files: [], reachedWhen: { response: '/api/clusters' } }],
+      }),
+      allowedCapabilities: ['live'],
+      stepRunner: makeStepRunner(),
+    });
+
+    const scan = await runner.scan(SCREEN);
+
+    expect(scan.reachedResponseSeen).toBe(true);
   });
 
   it('reads a reachedWhen that throws in the DOM as absent, not a scan failure', async () => {

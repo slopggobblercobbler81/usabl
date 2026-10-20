@@ -6,7 +6,7 @@
  */
 import { AxeBuilder } from '@axe-core/playwright';
 import { chromium, type Browser, type BrowserContext, type CDPSession, type Page as PwPage } from 'playwright';
-import type { AxNode, BrowserDriver, Page } from '../contracts/index.js';
+import type { ApiResponse, AxNode, BrowserDriver, Page } from '../contracts/index.js';
 import { applyAxeTags, type AxeIssue, type AxeRuleSummary } from '../providers/axe/index.js';
 
 // Default budget for one screen to navigate, go quiet, and stop rendering. An authenticated
@@ -379,20 +379,40 @@ export function readyTimeoutMsFor(config: { readyTimeoutMs?: number }): number {
 export interface NetworkActivity {
   networkQuietFor(windowMs: number): boolean;
   unauthorizedApiUrls(): string[];
+  apiResponses(): ApiResponse[];
+  // Records how many requests had been sent when the walk began. See Page.markWalkStart.
+  markWalkStart(): void;
+}
+
+// The subset of a Playwright request this tracker reads. Playwright hands the same object to the
+// request event and to response.request(), which is what lets a response be dated by when its
+// request was sent.
+export interface RequestHandle {
+  resourceType(): string;
+  // The request this one was redirected from, if any. A redirect is a new request object.
+  redirectedFrom?(): RequestHandle | null;
 }
 
 // The subset of a Playwright response this tracker reads. Narrow so a test can drive it.
 export interface ResponseEvent {
   status(): number;
   url(): string;
-  request(): { resourceType(): string };
+  // Header names in lower case, as Playwright gives them. Optional so a driver without headers
+  // still works; such a response has no content type.
+  headers?(): Record<string, string>;
+  request(): RequestHandle;
 }
 
 // The subset of a Playwright page this tracker listens to. Narrow so a test can drive it.
 export interface RequestEvents {
-  on(event: 'request' | 'requestfinished' | 'requestfailed', handler: () => void): void;
+  on(event: 'request', handler: (request: RequestHandle) => void): void;
+  on(event: 'requestfinished' | 'requestfailed', handler: () => void): void;
   on(event: 'response', handler: (response: ResponseEvent) => void): void;
 }
+
+// How far back a redirect chain is followed to find the request that started it. A browser stops
+// a fetch after 20 redirects, so a longer chain is not a real one.
+const REDIRECT_CHAIN_LIMIT = 20;
 
 // The resource types Playwright gives a request the page's own script issued. A document, a
 // stylesheet, an image, or a font that answers 401 is a missing asset, not a refused session, so
@@ -420,6 +440,42 @@ export function makeNetworkActivityTracker(
   // runner reads this twice for exactly that reason. What it cannot hold is a response that
   // arrives after the last read, which is the one boundary nothing here can close.
   const unauthorized: string[] = [];
+  // Every data response, refused or not, in the same arrival order and from the same handler, so
+  // a refusal can be read against what the application answered for that address afterwards, and
+  // a declared readiness response can be looked up. Cumulative for the life of the page, like the
+  // refusal record.
+  //
+  // Each is kept with the position its request was sent in, so a read can tell traffic the page
+  // sent on load from traffic sent after the walk began. The answer itself can arrive at any time.
+  const responses: Array<{ url: string; status: number; contentType: string | null; sentIndex: number | null }> = [];
+  // The position each request was sent in, by request object. Weak, so a closed page's requests
+  // are not kept alive.
+  const sentOrder = new WeakMap<object, number>();
+  let sentCount = 0;
+  // How many requests had been sent when the walk began, or null before that.
+  let walkMark: number | null = null;
+
+  // The position of the request that started a redirect chain, or null when it was never seen.
+  const sentIndexOf = (request: RequestHandle): number | null => {
+    let first: RequestHandle = request;
+    for (let hop = 0; hop < REDIRECT_CHAIN_LIMIT; hop += 1) {
+      const previous = typeof first.redirectedFrom === 'function' ? first.redirectedFrom() : null;
+      if (previous === null || previous === undefined) {
+        break;
+      }
+      first = previous;
+    }
+    return sentOrder.get(first) ?? null;
+  };
+
+  const contentTypeOf = (response: ResponseEvent): string | null => {
+    try {
+      const value = typeof response.headers === 'function' ? response.headers()['content-type'] : undefined;
+      return typeof value === 'string' ? value : null;
+    } catch {
+      return null;
+    }
+  };
 
   const settled = (): void => {
     inFlight = Math.max(0, inFlight - 1);
@@ -428,8 +484,12 @@ export function makeNetworkActivityTracker(
     }
   };
 
-  page.on('request', () => {
+  page.on('request', (request) => {
     inFlight += 1;
+    if (typeof request === 'object' && request !== null) {
+      sentOrder.set(request, sentCount);
+    }
+    sentCount += 1;
   });
   page.on('requestfinished', settled);
   page.on('requestfailed', settled);
@@ -437,13 +497,16 @@ export function makeNetworkActivityTracker(
     // A listener that throws would take down the page event emitter, and a status read on a
     // response from a frame that has already gone can throw. Nothing here is worth that.
     try {
-      if (response.status() !== UNAUTHENTICATED_STATUS) {
+      const request = response.request();
+      if (!PAGE_DATA_RESOURCE_TYPES.has(request.resourceType())) {
         return;
       }
-      if (!PAGE_DATA_RESOURCE_TYPES.has(response.request().resourceType())) {
-        return;
+      const status = response.status();
+      const url = response.url();
+      responses.push({ url, status, contentType: contentTypeOf(response), sentIndex: sentIndexOf(request) });
+      if (status === UNAUTHENTICATED_STATUS) {
+        unauthorized.push(url);
       }
-      unauthorized.push(response.url());
     } catch {
       return;
     }
@@ -458,6 +521,19 @@ export function makeNetworkActivityTracker(
     },
     unauthorizedApiUrls(): string[] {
       return [...unauthorized];
+    },
+    apiResponses(): ApiResponse[] {
+      return responses.map((response) => ({
+        url: response.url,
+        status: response.status,
+        contentType: response.contentType,
+        sentBeforeWalk: walkMark === null || (response.sentIndex !== null && response.sentIndex < walkMark),
+      }));
+    },
+    markWalkStart(): void {
+      if (walkMark === null) {
+        walkMark = sentCount;
+      }
     },
   };
 }
@@ -580,6 +656,12 @@ function wrapPage(
     },
     async unauthorizedApiRequests(): Promise<string[]> {
       return network.unauthorizedApiUrls();
+    },
+    async apiResponses(): Promise<ApiResponse[]> {
+      return network.apiResponses();
+    },
+    async markWalkStart(): Promise<void> {
+      network.markWalkStart();
     },
     async countEverywhere(selector: string): Promise<number> {
       // A Playwright locator pierces open shadow roots on its own, and every frame is asked, so a

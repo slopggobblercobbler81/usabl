@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Orders</title>
+  </head>
+  <body>
+    <main id="root">
+      <p>Loading</p>
+    </main>
+    <script>
+      // The real screen. It asks for its own data and renders its own table from it. When the
+      // page is opened with ?recover=1 its identity call is refused once, the client refreshes,
+      // and the same call is answered, which is the token refresh shape.
+      (async () => {
+        if (new URLSearchParams(location.search).get('recover') === '1') {
+          // One address per page load, so the server refuses this page's first identity call and
+          // answers its retry, whatever earlier tests asked for.
+          const identity = '/api/once/me?load=' + Math.random().toString(36).slice(2);
+          const first = await fetch(identity);
+          if (first.status === 401) {
+            await fetch('/api/data/refresh', { method: 'POST' });
+            await fetch(identity);
+          }
+        }
+        const response = await fetch('/api/data/orders');
+        const orders = await response.json();
+        const root = document.getElementById('root');
+        if (!root) {
+          return;
+        }
+        const rows = orders.map((order) => '<tr><td>' + order + '</td></tr>').join('');
+        root.innerHTML =
+          '<h1>Orders</h1>' +
+          '<table id="orders"><thead><tr><th>Order</th></tr></thead><tbody>' + rows + '</tbody></table>' +
+          '<button id="refresh" type="button">Refresh</button>';
+      })();
+    </script>
+  </body>
+</html>

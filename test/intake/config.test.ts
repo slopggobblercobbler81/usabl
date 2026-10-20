@@ -65,14 +65,94 @@ describe('parseUsablConfig surface reachedWhen', () => {
     }
   });
 
-  it('refuses a non-string reachedWhen', () => {
-    expect(() =>
-      parseUsablConfig(
-        configJson({
-          surfaces: [{ id: 'overview', url: 'http://127.0.0.1:5173/overview', files: ['src/Overview.tsx'], reachedWhen: 42 }],
-        }),
-      ),
-    ).toThrow(/reachedWhen/);
+  it('refuses a reachedWhen that is neither a string nor an object', () => {
+    for (const bad of [42, true, null, ['main#root']]) {
+      expect(() =>
+        parseUsablConfig(
+          configJson({
+            surfaces: [{ id: 'overview', url: 'http://127.0.0.1:5173/overview', files: ['src/Overview.tsx'], reachedWhen: bad }],
+          }),
+        ),
+      ).toThrow(/reachedWhen/);
+    }
+  });
+});
+
+describe('parseUsablConfig surface reachedWhen object form', () => {
+  const withSignal = (reachedWhen: unknown): string =>
+    configJson({
+      surfaces: [{ id: 'orders', url: 'http://127.0.0.1:5173/orders', files: ['src/Orders.tsx'], reachedWhen }],
+    });
+
+  it('reads a selector and a response together', () => {
+    const config = parseUsablConfig(withSignal({ selector: 'table#orders', response: '/api/orders' }));
+    expect(config.surfaces[0]?.reachedWhen).toEqual({ selector: 'table#orders', response: '/api/orders' });
+  });
+
+  it('reads a response on its own', () => {
+    const config = parseUsablConfig(withSignal({ response: '/api/orders' }));
+    expect(config.surfaces[0]?.reachedWhen).toEqual({ response: '/api/orders' });
+  });
+
+  it('reads a selector on its own', () => {
+    const config = parseUsablConfig(withSignal({ selector: 'table#orders' }));
+    expect(config.surfaces[0]?.reachedWhen).toEqual({ selector: 'table#orders' });
+  });
+
+  it('refuses an object that declares neither a selector nor a response', () => {
+    expect(() => parseUsablConfig(withSignal({}))).toThrow(/reachedWhen/);
+  });
+
+  it('refuses a key it does not know, so a misspelled signal is not silently dropped', () => {
+    expect(() => parseUsablConfig(withSignal({ selector: 'table#orders', respone: '/api/orders' }))).toThrow(
+      /respone/,
+    );
+  });
+
+  it('refuses an empty selector inside the object', () => {
+    expect(() => parseUsablConfig(withSignal({ selector: '  ' }))).toThrow(/reachedWhen\.selector/);
+  });
+
+  it('refuses a response that is not a path on the application', () => {
+    for (const bad of ['', 'api/orders', '//cdn.example/api', 'http://127.0.0.1:5173/api/orders', '/api/orders?x=1', '/api/orders#top', '/api/my orders', 42]) {
+      expect(() => parseUsablConfig(withSignal({ response: bad }))).toThrow(/reachedWhen\.response/);
+    }
+  });
+
+  it('refuses the bare root path, because every request on the host would satisfy it', () => {
+    expect(() => parseUsablConfig(withSignal({ response: '/' }))).toThrow(/reachedWhen\.response/);
+  });
+
+  // Each of these is written one way and compared another. URL parsing resolves dot segments, reads
+  // a backslash as a slash, and strips a trailing control character, so most of them come out as
+  // "/", which every data request on the host satisfies. The message never repeats the value.
+  const rootInDisguise: Array<[string, string]> = [
+    ['a dot-dot segment that climbs back to the root', '/api/..'],
+    ['a single dot segment', '/.'],
+    ['percent-encoded dot-dot segments', '/%2e%2e/'],
+    ['percent-encoded dot-dot segments in upper and mixed case', '/api/%2E%2e/'],
+    ['a dot segment next to an encoded one', '/api/.%2E'],
+    ['a dot segment in the middle of a path', '/api/./users'],
+    ['a backslash, which the URL parser reads as a slash', '/\\x'],
+    ['a backslash later in the path', '/api\\users'],
+    ['a control character the URL parser strips', '/\u0001'],
+  ];
+  for (const [name, bad] of rootInDisguise) {
+    it(`refuses ${name}, and does not repeat the value`, () => {
+      let message = '';
+      try {
+        parseUsablConfig(withSignal({ response: bad }));
+      } catch (err) {
+        message = err instanceof Error ? err.message : String(err);
+      }
+      expect(message).toMatch(/reachedWhen\.response/);
+      expect(message).not.toContain(bad);
+    });
+  }
+
+  it('still reads a segment that only starts with a dot', () => {
+    const config = parseUsablConfig(withSignal({ response: '/api/.well-known/users' }));
+    expect(config.surfaces[0]?.reachedWhen).toEqual({ response: '/api/.well-known/users' });
   });
 });
 

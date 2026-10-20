@@ -158,14 +158,18 @@ unresolved files, and the refusal itself names `--partial`). Run `usabl baseline
 writes the floor over only the cleanly scanned screens, then review and commit it through a normal
 PR.
 
-Because ansible-ui is login-gated, declare a `reachedWhen` selector on each surface in
-`usabl.config.json`, naming content only that screen has (its own heading or table, never the shell,
-header, or navigation). A screen usabl cannot reach signed in is a coverage gap, never scored.
+Because ansible-ui is login-gated, declare a `reachedWhen` readiness signal on each surface in
+`usabl.config.json`: a selector naming content only that screen has (its own heading or table,
+never the shell, header, or navigation), a `response` path for a data request only that screen
+makes, or both, as `{ "selector": "...", "response": "/api/..." }`. A screen whose signal does not
+hold is a coverage gap, never scored. A screen usabl cannot reach signed in is a gap too.
 Three rules decide that, in order. Rule A: a session is configured and one of the application's
-own same-host data requests came back 401 at either of the two reads; nothing overrides it, not
-even a matched `reachedWhen`. Rule B: a session is configured and the page has a password field
-anywhere; a present `reachedWhen` match overrides it, which is what makes a real change-password
-screen scannable. Rule C: the browser landed on a different address and that page has a password
+own same-host data requests came back 401 at either of the two reads. A matched `reachedWhen`
+selector never overrides it. Only a token refresh stands it down: the declared `response` path was
+answered at an address that was never refused, and each refused address was answered later with a
+success. Rule B: a session is configured and the page has a password field
+anywhere; a `reachedWhen` signal that holds overrides it, which is what makes a real
+change-password screen scannable. Rule C: the browser landed on a different address and that page has a password
 field, with or without a session; a redirect alone does not fire it. `reachedWhen` is your
 assertion, not a proof usabl can check.
 

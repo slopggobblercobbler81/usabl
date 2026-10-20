@@ -27,7 +27,25 @@
  *   page's own fetch or XHR requests to the application's own hostname had answered 401 at either
  *   of two reads: the first when readiness settles, the second after the walk, the checks, the
  *   source attachment, and the reachability measurement have run. A refusal that arrives after the
- *   second read is not seen. Nothing overrides it.
+ *   second read is not seen.
+ *
+ *   One thing stands a refusal down, and it needs every one of these facts together:
+ *
+ *     - the surface's readiness signal declares a response path. A selector on its own, which is
+ *       what the string form of reachedWhen is, never stands Rule A down, exactly as before
+ *       recovery was read at all;
+ *     - that path was answered with a 2xx, not an HTML page, at an address that was never refused
+ *       in this record, by a request sent before the walk began;
+ *     - a declared selector did not fail at load;
+ *     - the last answer the page recorded for each refused address was a 2xx that is not an HTML
+ *       page.
+ *
+ *   That is a token refresh: the identity call is refused, the client refreshes, the same call is
+ *   answered, and the screen's own data arrives. No one fact is enough. A 401 followed by a 200 can
+ *   be an application that dropped its stale token and was answered as an anonymous visitor, and a
+ *   single 200 must not count both as the signal holding and as the refused address recovering,
+ *   which is why the signal has to be held by an address that was never refused. See
+ *   recoveryStandsDown and unrecoveredRefusals.
  *
  *   The application's hostname, not any host. An optional widget, an analytics beacon, or a
  *   third-party service whose own credentials are stale can answer 401 while the application
@@ -57,9 +75,9 @@
  *   address is not consulted, because the application that produced this defect never changes it.
  *   A signed-in session has no business being shown a password field.
  *
- *   Overridden by reachedWhen. When the surface declares a reachedWhen selector and that selector
- *   is present at the time of the check, this rule does not fire. The operator has made a positive
- *   assertion that this screen rendered, and that outranks a heuristic that it did not. A
+ *   Overridden by reachedWhen. When the surface declares a reachedWhen readiness signal and every
+ *   part of it holds at the time of the check, this rule does not fire. The operator has made a
+ *   positive assertion that this screen rendered, and that outranks a heuristic that it did not. A
  *   change-password screen, or a settings page with a re-authentication prompt, is exactly the
  *   case the override exists for: a real signed-in screen that really does contain a password
  *   field, which would otherwise be discarded on every run with no way to say so.
@@ -71,7 +89,8 @@
  *
  *   The override does not extend to Rule A, for the same reason. A same-host 401 with a configured
  *   session is the application itself saying the session was refused, which is stronger evidence
- *   than any selector an operator wrote.
+ *   than any selector an operator wrote. Only the application answering that same address later,
+ *   with the declared response held at another address, can stand it down.
  *
  * Rule C, redirected to a login page. Fires whether or not a storage state is configured, when the
  *   address the browser ended on differs from the one requested AND a password field is present.
@@ -91,11 +110,13 @@
  * an optional feature on the application's own API that this identity is not entitled to and whose
  * server answers 401 rather than 403, and it fires on every page-initiated 401 when appBaseUrl
  * cannot be parsed. Rule B fires on a signed-in screen that really does contain a password field
- * and declares no reachedWhen. Rule C fires on a screen reached at a different
+ * and declares no readiness signal that holds. Rule C fires on a screen reached at a different
  * path or fragment than the one configured that also shows a password field, which in practice is
  * a stale configured URL. In all three the cost is a coverage gap, so the run reports not_covered
  * rather than a verdict, and the fix is to correct the surface URL or to declare a reachedWhen
- * selector for that screen.
+ * readiness signal for that screen. Rule A also fires on a refusal the application recovered from
+ * when the screen declares no response path, because recovery alone is not proof the session
+ * worked.
  *
  * FALSE NEGATIVES, which matter more and are real.
  *
@@ -107,17 +128,26 @@
  * lives on an unrelated hostname is not caught by Rule A, and neither is a 401 that arrives after
  * the second read. Rule B passes a wrong page whenever the surface declares a reachedWhen selector
  * that a login wall also matches, which any shell, header, navigation, or footer selector does.
- * The body-only detector in
- * coverage/unseen.ts catches the subset of these that render nothing focusable; the rest stay open.
- * A miss leaves the behaviour that was there before, so it never manufactures a new false green,
- * and the reachedWhen selector on a surface is the operator's positive assertion for a screen where
- * these heuristics are not enough.
+ * The body-only detector in coverage/unseen.ts catches the subset of these that render nothing
+ * focusable. A declared readiness signal (reachedWhen, see providers/reachability.ts) catches the
+ * rest for that screen, because none of these pages renders the screen's own content or asks for
+ * its own data; the unseen pass in coverage/unseen.ts turns a signal that did not hold into a gap.
+ * Without a signal they stay open. A miss leaves the behaviour that was there before, so it never
+ * manufactures a new false green.
  *
  * This unit reports coverage. It must never mint a verdict.
  */
-import type { CoverageGap, Page } from '../contracts/index.js';
+import type { ApiResponse, CoverageGap, Page, ReachedWhenSignal } from '../contracts/index.js';
 import { STORAGE_STATE_ENV_VAR } from '../deps/session.js';
-import { measureReachability } from './reachability.js';
+import { appHostname, isAppHost, requestHostname } from './app-host.js';
+import {
+  isHtmlContentType,
+  measureReadiness,
+  readApiResponses,
+  readinessMet,
+  readinessSignalOf,
+  responseSignalSeen,
+} from './reachability.js';
 
 /**
  * A password input is the strongest generic sign-in signal a page can carry. It is one element
@@ -145,9 +175,9 @@ export interface LandingObservation {
    */
   sessionConfigured: boolean;
   /**
-   * The operator's positive assertion that this screen rendered, measured at the time of the
-   * check: null when the surface declared no reachedWhen selector, true when it declared one and
-   * it matched, false when it declared one and nothing matched. Only true overrides Rule B.
+   * The selector part of the operator's readiness signal, measured at the time of the check: null
+   * when the surface declared no selector, true when it declared one and it matched, false when it
+   * declared one and nothing matched.
    *
    * Measured here as well as after the providers run, because the two answer different questions.
    * The later measurement is the one recorded on the scan for the unseen detector. This one has to
@@ -155,6 +185,33 @@ export interface LandingObservation {
    * whether to run at all.
    */
   reachedSelectorPresent: boolean | null;
+  /**
+   * The response part of the readiness signal, measured at the same moment. Absent or null when
+   * the surface declared no response. The signal as a whole holds only when every declared part
+   * holds, and only a signal that holds overrides Rule B or lets a recovered refusal stand.
+   */
+  reachedResponseSeen?: boolean | null;
+  /**
+   * The response path the surface declared, or absent or null when it declared none. Rule A reads
+   * it to decide whether a refusal the application recovered from can stand down, against the
+   * response record as it is at that read.
+   */
+  reachedWhenResponse?: string | null;
+  /**
+   * Every fetch or XHR response the page recorded, in arrival order. Rule A reads it to tell a
+   * refusal the application recovered from from one it did not. Absent means none was recorded.
+   */
+  apiResponses?: ApiResponse[];
+}
+
+/** Whether the observation carries a readiness signal that held as a whole. */
+function signalHeld(observation: LandingObservation): boolean {
+  return (
+    readinessMet({
+      selectorPresent: observation.reachedSelectorPresent,
+      responseSeen: observation.reachedResponseSeen ?? null,
+    }) === true
+  );
 }
 
 /**
@@ -171,7 +228,7 @@ export async function observeLanding(
     requestedUrl: string;
     appBaseUrl: string;
     sessionConfigured: boolean;
-    reachedWhen: string | undefined;
+    reachedWhen: string | ReachedWhenSignal | undefined;
   },
 ): Promise<LandingObservation> {
   let landedUrl: string | null = null;
@@ -187,14 +244,21 @@ export async function observeLanding(
   } catch {
     passwordFieldPresent = false;
   }
+  const unauthorizedApiUrls = await readRefusedRequests(page);
+  const apiResponses = await readApiResponses(page);
+  const signal = readinessSignalOf(options.reachedWhen);
+  const readiness = await measureReadiness(page, signal, options.appBaseUrl);
   return {
     requestedUrl: options.requestedUrl,
     appBaseUrl: options.appBaseUrl,
     landedUrl,
     passwordFieldPresent,
-    unauthorizedApiUrls: await readRefusedRequests(page),
+    unauthorizedApiUrls,
     sessionConfigured: options.sessionConfigured,
-    reachedSelectorPresent: await measureReachability(page, options.reachedWhen),
+    reachedSelectorPresent: readiness.selectorPresent,
+    reachedResponseSeen: readiness.responseSeen,
+    reachedWhenResponse: signal?.response ?? null,
+    apiResponses,
   };
 }
 
@@ -243,26 +307,88 @@ export async function readRefusedRequests(page: Page): Promise<string[]> {
  * Exported so the rule that leans on it can be held without a browser.
  */
 export function refusalsFromAppHost(urls: readonly string[], appBaseUrl: string): string[] {
-  let appHost: string;
-  try {
-    appHost = new URL(appBaseUrl).hostname;
-  } catch {
-    return [...urls];
-  }
-  if (appHost.length === 0) {
+  const appHost = appHostname(appBaseUrl);
+  if (appHost === null) {
     return [...urls];
   }
   return urls.filter((url) => {
-    let host: string;
-    try {
-      // URL lowercases a hostname and encodes a unicode one as punycode, so both sides of this
-      // comparison are already in one form and no case folding of our own is needed.
-      host = new URL(url).hostname;
-    } catch {
-      return true;
-    }
-    return host === appHost || host.endsWith(`.${appHost}`);
+    const host = requestHostname(url);
+    return host === null || isAppHost(host, appHost);
   });
+}
+
+/**
+ * The comparable form of a request address: everything but the fragment. A browser never sends a
+ * fragment, so two records of one request can only differ there by accident. The query IS kept: a
+ * retry with a different query is a different request, and treating it as the same one would let
+ * an unrelated success answer for a refusal.
+ */
+function requestKey(url: string): string {
+  try {
+    const parsed = new URL(url);
+    parsed.hash = '';
+    return parsed.toString();
+  } catch {
+    return url;
+  }
+}
+
+/**
+ * The refused requests the application never recovered from.
+ *
+ * A refused address is recovered when the LAST answer the page recorded for that same address, by
+ * arrival order, was a 2xx that is not an HTML page. That is the token refresh shape: the identity
+ * call is refused, the client refreshes its credentials, and the same call is then answered. If
+ * the last answer was another refusal, a sign-in page, or nothing, it stays refused. A success on
+ * a different address, such as the refresh call itself, says nothing about whether this one was
+ * ever answered, so it never counts.
+ *
+ * This is only consulted when recoveryStandsDown says the screen's own data arrived on its own,
+ * because a 401 followed by a 200 on its own does not prove the session worked. An application can
+ * drop a stale token on a 401, retry the same call, and be answered as an anonymous visitor.
+ *
+ * Exported so the rule can be held without a browser.
+ */
+export function unrecoveredRefusals(refused: readonly string[], responses: readonly ApiResponse[]): string[] {
+  const last = new Map<string, ApiResponse>();
+  for (const response of responses) {
+    last.set(requestKey(response.url), response);
+  }
+  return refused.filter((url) => {
+    const answer = last.get(requestKey(url));
+    return (
+      answer === undefined || answer.status < 200 || answer.status > 299 || isHtmlContentType(answer.contentType)
+    );
+  });
+}
+
+/**
+ * Whether this record is allowed to stand refused requests down at all, before each one is read
+ * against its own later answer.
+ *
+ * It needs positive evidence that is independent of the refusals. The surface has to declare a
+ * response path, and that path has to have been answered by an address this record never refused,
+ * by the same rule the readiness signal uses: a 2xx on the application's own host, not an HTML
+ * page, from a request sent before the walk. A declared selector must not have failed at load.
+ *
+ * Without the "never refused" part, one 200 would do two jobs. A sign-in wall that refuses
+ * /api/users?page=1 and then answers the anonymous retry of that same address with a 200 would
+ * hold a "/api/users" signal and recover the refusal with the same answer. A selector on its own
+ * never stands Rule A down, because a selector is operator policy and a shell selector matches a
+ * login wall.
+ */
+function recoveryStandsDown(observation: LandingObservation): boolean {
+  const declaredPath = observation.reachedWhenResponse ?? null;
+  if (declaredPath === null || observation.reachedSelectorPresent === false) {
+    return false;
+  }
+  const responses = observation.apiResponses ?? [];
+  const refusedKeys = new Set([
+    ...observation.unauthorizedApiUrls.map(requestKey),
+    ...responses.filter((response) => response.status === 401).map((response) => requestKey(response.url)),
+  ]);
+  const neverRefused = responses.filter((response) => !refusedKeys.has(requestKey(response.url)));
+  return responseSignalSeen(neverRefused, declaredPath, observation.appBaseUrl);
 }
 
 /**
@@ -416,11 +542,16 @@ function notMeasured(screenId: string): string {
 export function redirectedAwayGap(screenId: string, observation: LandingObservation): CoverageGap | null {
   const requested = sanitizeUrlForDisplay(observation.requestedUrl);
 
-  // Rule A: the application's own data requests were refused as unauthenticated. Nothing
-  // overrides this, including a matched reachedWhen: reachedWhen is operator-supplied policy
-  // rather than independent proof, and a selector aimed at a persistent shell is present on a
-  // login wall too. The application refusing the session is the stronger evidence.
-  const refused = refusalsFromAppHost(observation.unauthorizedApiUrls, observation.appBaseUrl);
+  // Rule A: the application's own data requests were refused as unauthenticated. A selector does
+  // not override this: reachedWhen is operator-supplied policy rather than independent proof, and
+  // a selector aimed at a persistent shell is present on a login wall too. The application
+  // refusing the session is the stronger evidence. The one exception is a token refresh: the
+  // declared response path was answered at an address that was never refused, AND each refused
+  // address was answered later. See recoveryStandsDown.
+  const fromAppHost = refusalsFromAppHost(observation.unauthorizedApiUrls, observation.appBaseUrl);
+  const refused = recoveryStandsDown(observation)
+    ? unrecoveredRefusals(fromAppHost, observation.apiResponses ?? [])
+    : fromAppHost;
   if (observation.sessionConfigured && refused.length > 0) {
     const example = sanitizeRefusedUrlForDisplay(refused[0] as string);
     const count = refused.length;
@@ -437,13 +568,9 @@ export function redirectedAwayGap(screenId: string, observation: LandingObservat
   }
 
   // Rule B: a password field anywhere, with a session asserted and no positive assertion from the
-  // operator that this screen rendered. A matched reachedWhen outranks the heuristic, which is
-  // what makes a genuine change-password or re-authenticate screen scannable.
-  if (
-    observation.sessionConfigured &&
-    observation.passwordFieldPresent &&
-    observation.reachedSelectorPresent !== true
-  ) {
+  // operator that this screen rendered. A readiness signal that held outranks the heuristic, which
+  // is what makes a genuine change-password or re-authenticate screen scannable.
+  if (observation.sessionConfigured && observation.passwordFieldPresent && !signalHeld(observation)) {
     return gapFor(
       observation.requestedUrl,
       `usabl asked for ${requested} with a configured session and the page it got asks for a ` +

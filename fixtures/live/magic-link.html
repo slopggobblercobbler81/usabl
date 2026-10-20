@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Sign in</title>
+  </head>
+  <body>
+    <main>
+      <h1>Sign in</h1>
+      <!--
+        A magic-link page: it asks for an email address and sends a sign-in link. No password field
+        and no data request until the form is sent, which the scan never does.
+      -->
+      <form method="post" action="/magic-link">
+        <label for="email">Email</label>
+        <input id="email" name="email" type="email" autocomplete="email" />
+        <button id="send-link" type="submit">Email me a sign-in link</button>
+      </form>
+    </main>
+  </body>
+</html>

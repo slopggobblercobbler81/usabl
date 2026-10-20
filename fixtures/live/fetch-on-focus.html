@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Welcome</title>
+  </head>
+  <body>
+    <main>
+      <h1>Welcome</h1>
+      <!--
+        This page asks for no data on load. Focusing the button sends a request for the screen's
+        data path, so the only answer to that path is one the keyboard walk caused.
+      -->
+      <button id="load" type="button">Load orders</button>
+    </main>
+    <script>
+      document.getElementById('load').addEventListener('focus', () => {
+        fetch('/api/data/orders').catch(() => undefined);
+      });
+    </script>
+  </body>
+</html>

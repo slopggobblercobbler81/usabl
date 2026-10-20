@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Welcome</title>
+  </head>
+  <body>
+    <main>
+      <h1>Welcome</h1>
+      <!--
+        An authentication wall in front of the application. The server answers 200 to every
+        address under it, including the status call this page makes, so no request is ever refused.
+      -->
+      <p>Sign in through your organization to continue.</p>
+      <a id="continue" href="/wall/start">Continue</a>
+    </main>
+    <script>
+      fetch('/wall/status').catch(() => undefined);
+    </script>
+  </body>
+</html>

@@ -174,6 +174,22 @@ the tool errored, not because the page is accessible.
   block, and the summary reports the gap count under either one, so incomplete proof is never
   presented as proof.
 
+- A scan that reached the wrong page, such as a sign-in page served in place of a screen with
+  a dead session, is a coverage gap, never a measurement of that screen. Three heuristics catch
+  a refused data request, a password field, and a redirect to a page with a password field. A
+  per-surface readiness signal (`reachedWhen`: a selector, a data response path, or both) is the
+  positive check for what they miss, such as a passkey page, a magic-link page, or an
+  authentication wall that answers 200 but does not request the screen's data path or answers it
+  with HTML. A signal that does not hold drops the screen's findings
+  and gaps it. The signal is operator policy, not proof: a selector a sign-in page also matches,
+  or a path a wall answers with a 200 that is not HTML, lets a wrong page through. The selector
+  is read after the checks have run, so content a check caused counts toward it. The response
+  part counts only requests sent before the walk began, and never an HTML answer. A refused
+  request is stood down only when the surface declares a response path, that path was answered
+  at an address that was never refused, and the refused address was later answered with a 2xx
+  that is not HTML. A selector, or recovery alone, never stands it down. See ground-truth
+  section 8.
+
 **Status:** [x] The `not_covered` gap path and exit-4 fail-open ship. [ ] A per-surface
 time budget is not yet a config knob; the shipped bound is the keyboard-walk 15s wall clock.
 

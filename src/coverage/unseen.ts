@@ -18,10 +18,12 @@
  *      had nothing to walk. This is the sound floor and runs for every screen.
  *      A body-only screen is unseen even if reachedWhen matched, because a selector aimed at a
  *      persistent app shell matches on a login wall too.
- *   2. reachedSelectorPresent reads a per-surface assertion the operator declared and the scan
- *      measured against the live DOM. Only an explicit false (declared and absent) marks a screen
- *      unseen. A true value only suppresses its own reachedWhen gap; it never cancels the body-only
- *      floor. The two detectors are independent.
+ *   2. reachedSelectorPresent and reachedResponseSeen read the per-surface readiness signal the
+ *      operator declared and the scan measured against the live page: a selector that must match,
+ *      and a data response that must have been answered with a success. Only an explicit false
+ *      (declared and absent) marks a screen unseen, and either part being false is enough. A true
+ *      value only suppresses its own gap; it never cancels the body-only floor or the other part.
+ *      The detectors are independent.
  *
  * The findings are dropped, not downgraded. The gate weighs a new failure before it weighs
  * missing coverage on purpose, because a real new barrier is the actionable answer. Leaving
@@ -103,6 +105,13 @@ export function markUnseenScreens(screens: ScreenScan[]): UnseenPass {
       sentences.push(
         `Nothing matched reachedWhen selector ${selector} in the rendered page, so the element the ` +
           'operator said proves this screen loaded was absent.',
+      );
+    }
+    if (scan.reachedResponseSeen === false) {
+      const path = scan.reachedWhenResponse ?? 'the declared reachedWhen response';
+      sentences.push(
+        `No fetch or XHR request to ${path} on the application's own host was answered with a ` +
+          'success, so the data the operator said proves this screen loaded never arrived.',
       );
     }
     if (sentences.length === 0) {

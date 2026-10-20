@@ -233,6 +233,59 @@ describe('markUnseenScreens', () => {
     expect(pass.screens[0]?.applicability).toEqual([entry]);
   });
 
+  it('marks a screen unseen when its declared readiness response never arrived', () => {
+    // A passkey or magic-link sign-in page makes no API call and has real focusable controls, so
+    // neither the body-only floor nor a refused request says anything. The screen's own data
+    // request never succeeding is the positive evidence that is missing.
+    const pass = markUnseenScreens([
+      scan({
+        screenId: 'orders',
+        url: 'http://app/orders',
+        stops: [stop('button#passkey')],
+        drafts: [draft('orders')],
+        reachedResponseSeen: false,
+        reachedWhenResponse: '/api/orders',
+      }),
+    ]);
+    expect(pass.unseenScreenIds).toEqual(['orders']);
+    expect(pass.screens[0]?.drafts).toEqual([]);
+    expect(pass.screens[0]?.gaps).toHaveLength(1);
+    expect(pass.screens[0]?.gaps[0]?.reason).toContain('/api/orders');
+  });
+
+  it('keeps a screen whose declared readiness response arrived', () => {
+    const pass = markUnseenScreens([
+      scan({
+        screenId: 'orders',
+        url: 'http://app/orders',
+        stops: [stop('button#refresh')],
+        drafts: [draft('orders')],
+        reachedResponseSeen: true,
+        reachedWhenResponse: '/api/orders',
+      }),
+    ]);
+    expect(pass.unseenScreenIds).toEqual([]);
+    expect(pass.screens[0]?.drafts).toHaveLength(1);
+  });
+
+  it('marks a screen unseen when its selector matched but its response never arrived', () => {
+    // Both parts of a declared signal have to hold. A selector that a sign-in page happens to
+    // match does not cancel a missing data response.
+    const pass = markUnseenScreens([
+      scan({
+        screenId: 'orders',
+        url: 'http://app/orders',
+        stops: [stop('button#refresh')],
+        drafts: [draft('orders')],
+        reachedSelectorPresent: true,
+        reachedWhenSelector: 'main',
+        reachedResponseSeen: false,
+        reachedWhenResponse: '/api/orders',
+      }),
+    ]);
+    expect(pass.unseenScreenIds).toEqual(['orders']);
+  });
+
   it('keeps the gaps a scan already reported', () => {
     const pass = markUnseenScreens([
       scan({

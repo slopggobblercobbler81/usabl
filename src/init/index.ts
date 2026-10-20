@@ -16,6 +16,7 @@ import {
   type ParsedRouteSite,
 } from '../coverage/router-parse.js';
 import { validateId } from '../intake/id-grammar.js';
+import { STORAGE_STATE_ENV_VAR } from '../deps/session.js';
 import { APP_INIT_REFUSAL, unusableIdsError, type UnusableId } from './unusable-ids.js';
 
 // Init writes only these two drafts. Waivers stay human-authored judgment.
@@ -187,7 +188,56 @@ function surfaceUrl(baseUrl: string, routePath: string): string | null {
   }
 }
 
-export async function inferInit(fs: InitFs): Promise<InitDraft> {
+export interface InferInitOptions {
+  // Whether the operator ran init with a storage state configured. That is the operator saying
+  // this application is scanned signed in, which is the strongest sign init can read that it
+  // needs a login. Absent means no session was configured.
+  sessionConfigured?: boolean;
+}
+
+// Route path segments that name a sign-in, sign-out, or identity step. A naming convention, not
+// proof, which is fine here: it only decides whether init prints a recommendation, and a
+// recommendation on an application that needs no login costs the operator one line to ignore.
+const SIGN_IN_SEGMENT = /^(login|log-in|logon|signin|sign-in|sign_in|logout|log-out|signout|sign-out|auth|sso)$/i;
+
+function signInRoutePath(routes: readonly RouteEntry[]): string | null {
+  for (const route of routes) {
+    if (route.url.split('/').some((segment) => SIGN_IN_SEGMENT.test(segment))) {
+      return route.url;
+    }
+  }
+  return null;
+}
+
+/**
+ * The readiness signal recommendation for a login-gated application.
+ *
+ * A scan whose session has died can be handed a sign-in page instead of the screen it asked for.
+ * The session rules catch a refused data request, a password field, and a redirect to a page with a
+ * password field. They do not catch a passkey prompt, a magic-link page, or an authentication wall
+ * that answers 200 to everything: those are scored as the screen. Only a declared readiness signal
+ * tells those apart, and only the operator knows what each screen shows, so init recommends one
+ * for every screen and writes none itself. A guessed selector would be worse than none, because a
+ * selector that a sign-in page also matches reads as proof the screen rendered.
+ */
+function readinessRecommendation(reason: string, surfaces: readonly SurfaceConfig[]): string[] {
+  if (surfaces.length === 0) {
+    return [];
+  }
+  return [
+    `Review: this application looks login-gated (${reason}). Add a reachedWhen readiness signal to ` +
+      'every surface: a selector for content only that screen has, such as its own table or heading, ' +
+      'a response path for a data request only that screen makes, such as "/api/users", or both. ' +
+      'Without one, a sign-in page with no password field and no refused request, such as a passkey ' +
+      'or magic-link page, is scored as the screen.',
+    ...surfaces.map(
+      (surface) =>
+        `Review: surface "${operatorText(surface.id)}" has no reachedWhen readiness signal yet.`,
+    ),
+  ];
+}
+
+export async function inferInit(fs: InitFs, options: InferInitOptions = {}): Promise<InitDraft> {
   const notes: string[] = [];
   // Vite's default origin when server.port is absent. Call it out as a review
   // note so the operator does not treat the fallback as a measured fact.
@@ -347,6 +397,17 @@ export async function inferInit(fs: InitFs): Promise<InitDraft> {
     surfaces,
     guardedPaths: [...ALWAYS_GUARDED],
   };
+
+  const signInRoute = signInRoutePath(routes);
+  const loginReason =
+    options.sessionConfigured === true
+      ? `${STORAGE_STATE_ENV_VAR} is set, so scans run signed in`
+      : signInRoute === null
+        ? null
+        : `the router has a sign-in route, ${operatorText(signInRoute)}`;
+  if (loginReason !== null) {
+    notes.push(...readinessRecommendation(loginReason, surfaces));
+  }
 
   notes.push('Review: these files are drafts. Merge only after you check routes, globs, and URLs.');
 
