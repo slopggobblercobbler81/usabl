@@ -114,9 +114,13 @@ export function describeVerdict(result: Result): VerdictLine {
   };
 }
 
-/** The verdict word and exit code with no symbol, for readers that gain nothing from one. */
-export function formatVerdictWord(line: VerdictLine): string {
-  return `${line.word} (exit ${formatExitCode(line.exitCode)})`;
+/**
+ * The verdict word and exit code with no symbol, for readers that gain nothing from one. A note,
+ * when given, goes inside the parentheses after the exit code, so it is read with the verdict.
+ */
+export function formatVerdictWord(line: VerdictLine, note?: string): string {
+  const suffix = note === undefined ? '' : `, ${note}`;
+  return `${line.word} (exit ${formatExitCode(line.exitCode)}${suffix})`;
 }
 
 /** The full verdict line: symbol, word, and exit code. */

@@ -5,12 +5,13 @@
  * written. A file owned by another user cannot be made without root, so the owner the store reads
  * off a file is injected for that case.
  */
-import { chmod, lstat, mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from 'node:fs/promises';
+import { chmod, lstat, mkdir, mkdtemp, readFile, readdir, rm, stat, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import {
   makeFsSessionPinStore,
+  resolveSessionPinDir,
   sessionPinDir,
   type FsSessionPinStoreOptions,
 } from '../../src/surfaces/session-pin-store.js';
@@ -159,5 +160,137 @@ describe.skipIf(REAL_UID === null)('makeFsSessionPinStore', () => {
 
     expect(result.status).toBe('refused');
     await expect(readFile(join(scratch, 'escape.json'), 'utf8')).rejects.toThrow();
+  });
+
+  it('replaces a pin file by renaming a new file over it, never by cutting the old one in place', async () => {
+    const dir = join(scratch, 'pins');
+    const store = storeIn(dir);
+    await store.create('s.json', '{"a":"1"}');
+    const before = await stat(join(dir, 's.json'));
+
+    await expect(store.replace('s.json', '{"a":"2"}')).resolves.toEqual({ status: 'written' });
+
+    const after = await stat(join(dir, 's.json'));
+    expect(after.ino).not.toBe(before.ino);
+    expect(after.mode & 0o777).toBe(0o600);
+    // No temp file is left behind.
+    expect(await readdir(dir)).toEqual(['s.json']);
+  });
+
+  it('keeps the old pins whole when a replace stops before the new file is in place', async () => {
+    const dir = join(scratch, 'pins');
+    // A process killed after writing the new contents and before putting them in place.
+    const store = storeIn(dir, {
+      beforeCommit: async () => {
+        throw new Error('killed');
+      },
+    });
+    await mkdir(dir, { mode: 0o700 });
+    await writeFile(join(dir, 's.json'), '{"a":"1"}', { mode: 0o600 });
+
+    const result = await store.replace('s.json', '{"a":"2"}');
+
+    expect(result.status).toBe('refused');
+    await expect(readFile(join(dir, 's.json'), 'utf8')).resolves.toBe('{"a":"1"}');
+    expect(await readdir(dir)).toEqual(['s.json']);
+  });
+
+  it('never shows a half-written first pin file when a create stops before it is in place', async () => {
+    const dir = join(scratch, 'pins');
+    const store = storeIn(dir, {
+      beforeCommit: async () => {
+        throw new Error('killed');
+      },
+    });
+
+    const result = await store.create('s.json', '{"a":"1"}');
+
+    expect(result.status).toBe('refused');
+    expect(await readdir(dir)).toEqual([]);
+  });
+
+  it('gives every refusal a fix that names what to remove', async () => {
+    const dir = join(scratch, 'pins');
+    await mkdir(dir, { mode: 0o700 });
+    await writeFile(join(dir, 's.json'), '{"a":"planted"}');
+    await chmod(join(dir, 's.json'), 0o644);
+    const fileRefusal = await storeIn(dir).read('s.json');
+    expect(fileRefusal.status === 'refused' && fileRefusal.fix).toContain(`delete ${join(dir, 's.json')}`);
+
+    const shared = join(scratch, 'shared');
+    await mkdir(shared);
+    await chmod(shared, 0o777);
+    const dirRefusal = await storeIn(shared).read('s.json');
+    expect(dirRefusal.status === 'refused' && dirRefusal.fix).toContain(`remove ${shared}`);
+  });
+});
+
+describe('makeFsSessionPinStore where the platform reports no user id', () => {
+  it('skips the mode checks along with the owner checks, so pins still work', async () => {
+    // Windows reports modes such as 0o666 for every file, and no user id. Mode bits there say
+    // nothing about who can read the file, so they are not checked.
+    const dir = join(scratch, 'pins');
+    await mkdir(dir);
+    await chmod(dir, 0o777);
+    await writeFile(join(dir, 's.json'), '{"a":"1"}');
+    await chmod(join(dir, 's.json'), 0o666);
+    const store = makeFsSessionPinStore({ dir, uid: null });
+
+    await expect(store.read('s.json')).resolves.toEqual({ status: 'found', contents: '{"a":"1"}' });
+    await expect(store.replace('s.json', '{"a":"2"}')).resolves.toEqual({ status: 'written' });
+    await expect(store.create('t.json', '{"a":"3"}')).resolves.toEqual({ status: 'written' });
+    await expect(store.read('s.json')).resolves.toEqual({ status: 'found', contents: '{"a":"2"}' });
+  });
+});
+
+describe.skipIf(REAL_UID === null)('resolveSessionPinDir', () => {
+  const uid = REAL_UID as number;
+
+  async function privateRuntimeDir(): Promise<string> {
+    const runtime = join(scratch, 'runtime');
+    await mkdir(runtime, { mode: 0o700 });
+    await chmod(runtime, 0o700);
+    return runtime;
+  }
+
+  it('uses usabl-pins inside XDG_RUNTIME_DIR when it is a private directory of this user', async () => {
+    const runtime = await privateRuntimeDir();
+    expect(resolveSessionPinDir({ env: { XDG_RUNTIME_DIR: runtime }, tmpDir: '/tmp', uid })).toBe(
+      join(runtime, 'usabl-pins'),
+    );
+  });
+
+  it('falls back to the temp directory when XDG_RUNTIME_DIR is owned by another user', async () => {
+    // What this host shows: /run/user/<uid> exists but root owns it with mode 0755.
+    const runtime = await privateRuntimeDir();
+    const ownerOf = () => 0;
+    expect(resolveSessionPinDir({ env: { XDG_RUNTIME_DIR: runtime }, tmpDir: '/tmp', uid, ownerOf })).toBe(
+      sessionPinDir('/tmp', uid),
+    );
+  });
+
+  it('falls back when XDG_RUNTIME_DIR gives group or other users any access', async () => {
+    const runtime = await privateRuntimeDir();
+    await chmod(runtime, 0o755);
+    expect(resolveSessionPinDir({ env: { XDG_RUNTIME_DIR: runtime }, tmpDir: '/tmp', uid })).toBe(
+      sessionPinDir('/tmp', uid),
+    );
+  });
+
+  it('falls back when XDG_RUNTIME_DIR is a symbolic link, relative, missing, or unset', async () => {
+    const runtime = await privateRuntimeDir();
+    const link = join(scratch, 'runtime-link');
+    await symlink(runtime, link);
+    for (const value of [link, 'relative/runtime', join(scratch, 'absent'), '', undefined]) {
+      const env = value === undefined ? {} : { XDG_RUNTIME_DIR: value };
+      expect(resolveSessionPinDir({ env, tmpDir: '/tmp', uid })).toBe(sessionPinDir('/tmp', uid));
+    }
+  });
+
+  it('falls back when the platform reports no user id, because the owner cannot be checked', async () => {
+    const runtime = await privateRuntimeDir();
+    expect(resolveSessionPinDir({ env: { XDG_RUNTIME_DIR: runtime }, tmpDir: '/tmp', uid: null })).toBe(
+      sessionPinDir('/tmp', null),
+    );
   });
 });

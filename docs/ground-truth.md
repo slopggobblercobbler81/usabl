@@ -1188,29 +1188,52 @@ committed tamper that git-status-clean cannot see.
 
 The temp dir is shared by every local user, so pins are kept private to the user:
 
-- They live in one directory per user, `usabl-pins-<uid>` under the temp dir, created
-  with mode 0700. The user id in the name binds the pins to the user. Before any read or
-  write the directory is checked with `lstat`: it must be a real directory, not a symlink,
-  owned by this user, with no permission bits for group or others.
-- A pin file, `<session id>-<repository key>.json`, is created exclusively (`O_CREAT` with
-  `O_EXCL`) with mode 0600, so a file that is already there is never adopted.
-- A pin file is opened with `O_NOFOLLOW` after an `lstat` check, so a symlink at the path
-  is refused, never followed. The open handle is then checked with `fstat`: a regular file,
-  owned by this user, with no permission bits for group or others.
+- They live in one directory per user. When `$XDG_RUNTIME_DIR` is set, is absolute, and
+  passes the checks below, that is `usabl-pins` inside it. On Linux with systemd this is
+  `/run/user/<uid>`, which the system creates at login for that user alone. Otherwise it
+  is `usabl-pins-<uid>` under the temp dir. Some hosts set `$XDG_RUNTIME_DIR` to a
+  directory that fails the checks, such as one owned by root with mode 0755; the temp
+  dir is then used.
+- The pin directory is created with mode 0700. Before any read or write it is checked
+  with `lstat`: it must be a real directory, not a symlink, owned by this user, with no
+  permission bits for group or others.
+- A pin file, `<session id>-<repository key>.json`, is opened with `O_NOFOLLOW` after an
+  `lstat` check, so a symlink at the path is refused, never followed. The open handle is
+  then checked with `fstat`: a regular file, owned by this user, with no permission bits
+  for group or others.
+- A pin file is never changed in place. New pins are written to a temp file in the same
+  directory, created exclusively (`O_CREAT` with `O_EXCL`, plus `O_NOFOLLOW`) with mode
+  0600. That file is then renamed over the pin file, or for the first pins of a session
+  linked to the pin file name, which fails if anything is already there. A process killed
+  part way leaves the old pins whole, never an empty file.
 
-Any failed check refuses with a plain reason, reads nothing, and writes nothing. The stop
-then goes on without the drift comparison and says so on stderr (`NOT verified - usabl did
-not use session pins for this stop because ...`). It does not block, because a block would
-trap the session behind a file another user controls; this is the same fail-open choice as
-the exit 4 decision in the threat model. A refusal is never read as "no pins yet", which is
-what would let a planted file be adopted.
+Any failed check refuses with a plain reason and a fix, and writes nothing. A pin file of
+ours that does not parse is refused the same way: it is never read as "no pins yet",
+because recording fresh pins over it would take whatever is committed now, a tamper
+included, as the baseline. The stop then goes on without the drift comparison. It does
+not block, because a block would trap the session behind a file another user may
+control; this is the same fail-open choice as the exit 4 decision in the threat model.
+It is never silent. The decision line carries a note, for example `VERIFIED (exit 0,
+session drift not checked): ...`, and stderr ends with the reason and the fix:
+`NOT verified - usabl did not use session pins for this stop because ... To fix: delete
+<path>. The next stop records new pins for this session.`
 
-What this does not cover. Another local user can still deny the drift check by creating
-`usabl-pins-<uid>` first: the check is then skipped on every stop, loudly. On Windows the
-platform reports no user id, so the directory has no id in its name and the owner checks are
-skipped; the per-user temp dir Windows gives each account is what keeps it private. The checks
-assume the temp dir only lets an entry's owner remove or rename it, which the sticky bit on
-`/tmp` provides.
+What this does not cover:
+
+- Pins are best-effort against an agent with a shell. Deleting the pin file, as the same
+  user, resets the session baseline with no message: the next stop records new pins
+  from what is committed then. Any process running as the user can do that, so pins
+  catch a committed tamper only from an agent that does not also remove the pins.
+- Where the temp dir is used, another local user can deny the drift check by creating
+  `usabl-pins-<uid>` first. The check is then skipped on every stop, loudly. Under
+  `$XDG_RUNTIME_DIR` on systemd Linux this denial goes away, because no other user can
+  create anything in that directory.
+- On Windows the platform reports no user id, so the directory has no id in its name and
+  the owner and mode checks are skipped. Windows reports modes such as 0o666 that say
+  nothing about who can read a file. The per-user temp dir Windows gives each account is
+  what keeps it private.
+- The checks assume the temp dir only lets an entry's owner remove or rename it, which
+  the sticky bit on `/tmp` provides.
 
 ### Receipt binding
 
@@ -1863,8 +1886,9 @@ self-check.
   are honest `not_covered`, never silent passes.
 - Identity-weak rules (missing accessible name) use count-based identity because you
   cannot honestly key an unnamed element by name.
-- Session pinning is best-effort (stored in a private per-user temp dir, clearable by
-  the OS, and skipped with a disclosure when that dir is not private).
+- Session pinning is best-effort (stored in a private per-user dir, clearable by the OS
+  or by the same user with no message, and skipped with a disclosure when that dir is not
+  private).
 
 ---
 

@@ -26,7 +26,14 @@ import { frameUntrustedBlock, scrubResult } from './scrub.js';
 
 export interface HookContext {
   stopHookActive: boolean;
+  // False when the Stop hook did not compare session pins on this stop, for example because the
+  // pin store refused. An allow that would otherwise read as a pass then says so on its first
+  // line. Absent means the comparison ran or had nothing to compare yet.
+  sessionDriftChecked?: boolean;
 }
+
+// The note an allow line carries when the session drift comparison did not run.
+const DRIFT_NOT_CHECKED = 'session drift not checked';
 
 export interface StopDecision {
   block: boolean;
@@ -292,6 +299,7 @@ export function evaluateStopDecision(
   config?: UsablConfig,
 ): StopDecision {
   const safe = scrubResult(result);
+  const passNote = ctx.sessionDriftChecked === false ? DRIFT_NOT_CHECKED : undefined;
 
   if (safe.verdict === 'verified') {
     const sourceTree = safe.receipt?.sourceTree;
@@ -302,7 +310,7 @@ export function evaluateStopDecision(
         : `the gate verified this change. Receipt sourceTree ${boundField(sourceTree, 'receipt')}.`;
     return {
       block: false,
-      message: `${formatVerdictWord(verdict)}: ${proof} You may stop.`,
+      message: `${formatVerdictWord(verdict, passNote)}: ${proof} You may stop.`,
     };
   }
 
@@ -330,7 +338,7 @@ export function evaluateStopDecision(
     const verdict = describeVerdict(safe);
     return {
       block: false,
-      message: `${formatVerdictWord(verdict)}: ${verdict.meaning} You may stop.`,
+      message: `${formatVerdictWord(verdict, passNote)}: ${verdict.meaning} You may stop.`,
     };
   }
 

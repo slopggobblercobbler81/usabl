@@ -16,13 +16,16 @@ export function memoryPinStore(): MemoryPinStore {
   return {
     files,
     writes,
+    locate(name) {
+      return name;
+    },
     async read(name) {
       const contents = files.get(name);
       return contents === undefined ? { status: 'missing' } : { status: 'found', contents };
     },
     async create(name, contents) {
       if (files.has(name)) {
-        return { status: 'refused', reason: 'a session pin file already exists' };
+        return { status: 'refused', reason: 'a session pin file already exists', fix: `delete ${name}.` };
       }
       files.set(name, contents);
       writes.push(name);
@@ -30,7 +33,7 @@ export function memoryPinStore(): MemoryPinStore {
     },
     async replace(name, contents) {
       if (!files.has(name)) {
-        return { status: 'refused', reason: 'the session pin file disappeared' };
+        return { status: 'refused', reason: 'the session pin file disappeared', fix: 'nothing.' };
       }
       files.set(name, contents);
       writes.push(name);

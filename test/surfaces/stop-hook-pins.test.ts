@@ -15,7 +15,7 @@
  * user id one higher than the real one, so everything the real user created reads as another
  * user's.
  */
-import { lstat, mkdtemp, readdir, readFile, rm, symlink, unlink, writeFile, chmod } from 'node:fs/promises';
+import { lstat, mkdir, mkdtemp, readdir, readFile, rm, symlink, unlink, writeFile, chmod } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
@@ -69,12 +69,15 @@ afterEach(async () => {
   await rm(scratch, { recursive: true, force: true });
 });
 
-async function stop(sessionId: string, options: { uid?: number } = {}) {
+async function stop(sessionId: string, options: { uid?: number; env?: Record<string, string | undefined> } = {}) {
   const stdout: string[] = [];
   const stderr: string[] = [];
   let engineRan = false;
+  // The environment is injected so a host XDG_RUNTIME_DIR never moves the pins out of the
+  // scratch temp directory these cases inspect.
+  const portOptions = { env: options.env ?? {}, ...(options.uid === undefined ? {} : { uid: options.uid }) };
   const ports = {
-    ...makeStopHookRunnerPorts(options.uid === undefined ? {} : { uid: options.uid }),
+    ...makeStopHookRunnerPorts(portOptions),
     cwd: () => '/repo/one',
     stdoutWrite: async (text: string) => {
       stdout.push(text);
@@ -191,5 +194,53 @@ describe.skipIf(REAL_UID === null)('Stop hook session pins on a shared temp dire
     const result = await stop('session-drift');
 
     expect(result.stdout).toContain('guarded policy drift');
+  });
+
+  it('never re-pins over a pin file of ours that does not parse, and says how to reset it', async () => {
+    // A pin file emptied or garbled by a crash or a tamper. Treating it as "no pins yet" would
+    // record the current, possibly tampered, state as the baseline and print only VERIFIED.
+    const path = await pinPathFor('session-garbled');
+    await writeFile(path, '');
+
+    const first = await stop('session-garbled');
+    const second = await stop('session-garbled');
+
+    for (const result of [first, second]) {
+      expect(result.exitCode).toBe(0);
+      expect(result.stderr).toContain('NOT verified');
+      expect(result.stderr).toContain('does not hold pins usabl can read');
+      expect(result.stderr).toContain(`delete ${path}`);
+      expect(result.engineRan()).toBe(true);
+    }
+    await expect(readFile(path, 'utf8')).resolves.toBe('');
+  });
+
+  it('ends stderr with the refusal, after a decision line that says drift was not checked', async () => {
+    const path = await pinPathFor('session-final-line');
+    await unlink(path);
+    await symlink(join(scratch, 'victim.txt'), path);
+
+    const result = await stop('session-final-line');
+
+    const lines = result.stderr.trimEnd().split('\n');
+    expect(lines.at(-2)).toBe(
+      'VERIFIED (exit 0, session drift not checked): the gate verified this change. You may stop.',
+    );
+    expect(lines.at(-1)).toBe(
+      'NOT verified - usabl did not use session pins for this stop because the session pin file is a ' +
+        'symbolic link. Guarded policy drift during this session was not checked. usabl changed nothing ' +
+        `there. To fix: delete ${path}. The next stop records new pins for this session.`,
+    );
+  });
+
+  it('keeps pins in XDG_RUNTIME_DIR when it is a private directory of this user', async () => {
+    const runtime = join(scratch, 'runtime');
+    await mkdir(runtime, { mode: 0o700 });
+
+    await stop('session-runtime', { env: { XDG_RUNTIME_DIR: runtime } });
+
+    const files = await pinFiles();
+    expect(files).toHaveLength(1);
+    expect(join(files[0] as string, '..')).toBe(join(runtime, 'usabl-pins'));
   });
 });

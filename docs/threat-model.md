@@ -41,15 +41,24 @@ re-baseline to green.
 - Stop hook session pins are private to the user. On a shared host another local
   user could precreate a pin file or a symlink at the pin path, to cause false
   drift blocks, poison the pins so a later tamper is not seen, or overwrite
-  another file the victim can write. Pins now live in a per-user directory
-  (`usabl-pins-<uid>`, mode 0700, checked as a real directory owned by the user
-  with no group or other bits), files are created exclusively with mode 0600, a
-  symlink is refused rather than followed (`O_NOFOLLOW` plus `lstat`), and an
-  open file is checked with `fstat` for owner and mode. A failed check reads and
-  writes nothing and the stop proceeds without the drift comparison, disclosed
-  as NOT verified. Residual: another user can still deny the drift check by
-  creating the per-user directory first; on Windows the owner checks are
-  skipped and the per-user temp directory is the boundary.
+  another file the victim can write. Pins now live in a per-user directory:
+  `usabl-pins` inside `$XDG_RUNTIME_DIR` when that is a private directory of the
+  user, otherwise `usabl-pins-<uid>` under the temp directory. The directory is
+  mode 0700, checked as a real directory owned by the user with no group or other
+  bits. A symlink is refused rather than followed (`O_NOFOLLOW` plus `lstat`), an
+  open file is checked with `fstat` for owner and mode, and new pins are written
+  to an exclusive 0600 temp file and renamed into place, so a killed process never
+  leaves an empty pin file. A failed check, or a pin file that does not parse,
+  reads nothing new and writes nothing. The stop proceeds without the drift
+  comparison: the decision line says `session drift not checked` and stderr ends
+  with NOT verified, the reason, and the fix. Residual: on systemd Linux,
+  `/run/user/<uid>` is created by the system for the user alone, so the "another
+  user creates the directory first" denial goes away there. Where the temp
+  directory is used, another user can still deny the drift check by creating the
+  per-user directory first. On Windows the owner and mode checks are skipped and
+  the per-user temp directory is the boundary. Deleting the pin file as the same
+  user resets the baseline with no message, so pins are best-effort against an
+  agent with a shell.
 
 **Status:** [x] Documented in ground-truth; demo skeptic script in judge pass.
 
