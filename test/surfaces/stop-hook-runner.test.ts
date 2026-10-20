@@ -4,7 +4,8 @@ import { makeFakeDeps } from '../../src/deps/fakes.js';
 import { mintReceipt } from '../../src/evidence/receipt.js';
 import { BYPASS_ONCE_PATH } from '../../src/surfaces/receipt-store.js';
 import { evaluateStopDecision } from '../../src/surfaces/stop-hook.js';
-import { runStopHookFromStdin, sessionPinPath } from '../../src/surfaces/stop-hook-runner.js';
+import { runStopHookFromStdin, sessionPinFileName } from '../../src/surfaces/stop-hook-runner.js';
+import { memoryPinStore } from '../support/memory-pin-store.js';
 
 class MemoryRunnerFs {
   private readonly files = new Map<string, string>();
@@ -67,21 +68,22 @@ function makePorts(overrides: {
   runEngine?: (deps: Deps, config: UsablConfig) => Promise<Result>;
   loadConfig?: () => Promise<UsablConfig>;
   buildDeps?: (config: UsablConfig) => Promise<Deps>;
-  tmpDir?: () => string;
   cwd?: () => string;
 } = {}) {
   const fs = new MemoryRunnerFs();
+  const pins = memoryPinStore();
   const stdout: string[] = [];
   const stderr: string[] = [];
   const deps = makeFakeDeps();
 
   return {
     fs,
+    pins,
     stdout,
     stderr,
     ports: {
       fs,
-      tmpDir: overrides.tmpDir ?? (() => '/tmp'),
+      pins,
       cwd: overrides.cwd ?? (() => '/repo/one'),
       writeTree: () => deps.git.writeTree(),
       stdoutWrite: async (text: string) => {
@@ -179,7 +181,7 @@ describe('stop-hook-runner protocol', () => {
   });
 
   it('blocks on session pin drift and keeps previous pins unchanged', async () => {
-    const { ports, fs, stdout } = makePorts({
+    const { ports, pins, stdout } = makePorts({
       runEngine: async () => {
         throw new Error('drift should block before engine run');
       },
@@ -188,8 +190,8 @@ describe('stop-hook-runner protocol', () => {
       'usabl.config.json': 'pin-old',
       '.usabl-evidence.json': 'pin-old-evidence',
     };
-    const pinsPath = sessionPinPath('/tmp', 'session-a', '/repo/one');
-    fs.set(pinsPath, JSON.stringify(previousPins, null, 2));
+    const pinName = sessionPinFileName('session-a', '/repo/one');
+    pins.files.set(pinName, JSON.stringify(previousPins, null, 2));
 
     const exitCode = await runStopHookFromStdin(
       JSON.stringify({ session_id: 'session-a', stop_hook_active: false }),
@@ -201,11 +203,11 @@ describe('stop-hook-runner protocol', () => {
     expect(payload.decision).toBe('block');
     expect(payload.reason).toContain('NOT verified');
     expect(payload.reason).toContain('guarded policy drift');
-    await expect(fs.readFile(pinsPath)).resolves.toBe(JSON.stringify(previousPins, null, 2));
+    expect(pins.files.get(pinName)).toBe(JSON.stringify(previousPins, null, 2));
   });
 
   it('allows active continuation on drift and still keeps previous pins', async () => {
-    const { ports, fs, stdout, stderr } = makePorts({
+    const { ports, pins, stdout, stderr } = makePorts({
       runEngine: async () => {
         throw new Error('active drift should not run engine');
       },
@@ -214,8 +216,8 @@ describe('stop-hook-runner protocol', () => {
       'usabl.config.json': 'pin-old',
       '.usabl-waivers.json': 'pin-old-waiver',
     };
-    const pinsPath = sessionPinPath('/tmp', 'session-b', '/repo/one');
-    fs.set(pinsPath, JSON.stringify(previousPins, null, 2));
+    const pinName = sessionPinFileName('session-b', '/repo/one');
+    pins.files.set(pinName, JSON.stringify(previousPins, null, 2));
 
     const exitCode = await runStopHookFromStdin(
       JSON.stringify({ session_id: 'session-b', stop_hook_active: true }),
@@ -226,7 +228,7 @@ describe('stop-hook-runner protocol', () => {
     expect(stdout.join('')).not.toContain('"decision":"block"');
     expect(stderr.join('')).toContain('NOT verified');
     expect(stderr.join('')).toContain('continuation already active');
-    await expect(fs.readFile(pinsPath)).resolves.toBe(JSON.stringify(previousPins, null, 2));
+    expect(pins.files.get(pinName)).toBe(JSON.stringify(previousPins, null, 2));
   });
 
   it('skips receipt fast path when guarded files are dirty', async () => {
@@ -283,7 +285,7 @@ describe('stop-hook-runner protocol', () => {
     // repository's pins in the second one.
     const repoOneDeps = makeFakeDeps({ headContents: { 'usabl.config.json': 'repo one config' } });
     const repoTwoDeps = makeFakeDeps({ headContents: { 'usabl.config.json': 'repo two config' } });
-    const { ports, fs, stdout, stderr } = makePorts({
+    const { ports, pins, stdout, stderr } = makePorts({
       cwd: () => '/repo/one',
       buildDeps: async () => repoOneDeps,
     });
@@ -291,9 +293,9 @@ describe('stop-hook-runner protocol', () => {
 
     await runStopHookFromStdin(stdin, ports);
 
-    const repoOnePins = sessionPinPath('/tmp', 'session-c', '/repo/one');
-    const repoOneAfterFirstRun = await fs.readFile(repoOnePins);
-    expect(repoOneAfterFirstRun).not.toBeNull();
+    const repoOnePins = sessionPinFileName('session-c', '/repo/one');
+    const repoOneAfterFirstRun = pins.files.get(repoOnePins);
+    expect(repoOneAfterFirstRun).toBeDefined();
 
     ports.cwd = () => '/repo/two';
     ports.buildDeps = async () => repoTwoDeps;
@@ -303,26 +305,26 @@ describe('stop-hook-runner protocol', () => {
     expect(exitCode).toBe(0);
     expect(stdout.join('')).not.toContain('"decision":"block"');
     expect(stderr.join('')).not.toContain('guarded policy drift');
-    const repoTwoPins = sessionPinPath('/tmp', 'session-c', '/repo/two');
+    const repoTwoPins = sessionPinFileName('session-c', '/repo/two');
     expect(repoTwoPins).not.toBe(repoOnePins);
-    const repoTwoAfterSecondRun = await fs.readFile(repoTwoPins);
-    expect(repoTwoAfterSecondRun).not.toBeNull();
+    const repoTwoAfterSecondRun = pins.files.get(repoTwoPins);
+    expect(repoTwoAfterSecondRun).toBeDefined();
     expect(repoTwoAfterSecondRun).not.toBe(repoOneAfterFirstRun);
-    await expect(fs.readFile(repoOnePins)).resolves.toBe(repoOneAfterFirstRun);
+    expect(pins.files.get(repoOnePins)).toBe(repoOneAfterFirstRun);
   });
 
   it('still reads the first repository pins when the session returns to it', async () => {
     const repoOneDeps = makeFakeDeps({ headContents: { 'usabl.config.json': 'repo one config' } });
     const repoTwoDeps = makeFakeDeps({ headContents: { 'usabl.config.json': 'repo two config' } });
-    const { ports, fs, stdout, stderr } = makePorts({
+    const { ports, pins, stdout, stderr } = makePorts({
       cwd: () => '/repo/one',
       buildDeps: async () => repoOneDeps,
     });
     const stdin = JSON.stringify({ session_id: 'session-d', stop_hook_active: false });
 
     await runStopHookFromStdin(stdin, ports);
-    const repoOnePins = sessionPinPath('/tmp', 'session-d', '/repo/one');
-    const afterFirstRun = await fs.readFile(repoOnePins);
+    const repoOnePins = sessionPinFileName('session-d', '/repo/one');
+    const afterFirstRun = pins.files.get(repoOnePins);
 
     ports.cwd = () => '/repo/two';
     ports.buildDeps = async () => repoTwoDeps;
@@ -335,21 +337,21 @@ describe('stop-hook-runner protocol', () => {
     expect(exitCode).toBe(0);
     expect(stdout.join('')).not.toContain('"decision":"block"');
     expect(stderr.join('')).not.toContain('guarded policy drift');
-    await expect(fs.readFile(repoOnePins)).resolves.toBe(afterFirstRun);
+    expect(pins.files.get(repoOnePins)).toBe(afterFirstRun);
   });
 
-  it('derives the same pins path for the same directory written different ways', () => {
-    const plain = sessionPinPath('/tmp', 'session-e', '/repo/one');
-    expect(plain.startsWith('/tmp/')).toBe(true);
-    expect(sessionPinPath('/tmp', 'session-e', '/repo/one/')).toBe(plain);
-    expect(sessionPinPath('/tmp', 'session-e', '/repo/one/.')).toBe(plain);
-    expect(sessionPinPath('/tmp', 'session-e', '/repo/one/sub/..')).toBe(plain);
-    expect(sessionPinPath('/tmp', 'session-e', '/repo/two')).not.toBe(plain);
+  it('derives the same pins file name for the same directory written different ways', () => {
+    const plain = sessionPinFileName('session-e', '/repo/one');
+    expect(plain.startsWith('session-e-')).toBe(true);
+    expect(plain).not.toContain('/');
+    expect(sessionPinFileName('session-e', '/repo/one/')).toBe(plain);
+    expect(sessionPinFileName('session-e', '/repo/one/.')).toBe(plain);
+    expect(sessionPinFileName('session-e', '/repo/one/sub/..')).toBe(plain);
+    expect(sessionPinFileName('session-e', '/repo/two')).not.toBe(plain);
   });
 
   it('ignores unsafe session ids and avoids unsafe writes', async () => {
-    const { ports, fs, stderr } = makePorts({
-      tmpDir: () => '/tmp/safe-root',
+    const { ports, fs, pins, stderr } = makePorts({
       runEngine: async () => baseResult({ verdict: 'verified', receipt: null }),
     });
 
@@ -363,5 +365,7 @@ describe('stop-hook-runner protocol', () => {
     expect(stderr.join('')).toContain('session_id');
     expect(fs.writes.every((path) => !path.includes('..'))).toBe(true);
     expect(fs.writes.every((path) => !path.includes('/etc/passwd'))).toBe(true);
+    // An unsafe id never reaches the pin store at all.
+    expect(pins.writes).toEqual([]);
   });
 });

@@ -38,6 +38,18 @@ re-baseline to green.
   head SHA for each dirty guarded path. CODEOWNERS is read from `--trusted-ref`, never the PR tree.
   Org team entries fail closed. The PR comment stays loud after the policy
   check is green.
+- Stop hook session pins are private to the user. On a shared host another local
+  user could precreate a pin file or a symlink at the pin path, to cause false
+  drift blocks, poison the pins so a later tamper is not seen, or overwrite
+  another file the victim can write. Pins now live in a per-user directory
+  (`usabl-pins-<uid>`, mode 0700, checked as a real directory owned by the user
+  with no group or other bits), files are created exclusively with mode 0600, a
+  symlink is refused rather than followed (`O_NOFOLLOW` plus `lstat`), and an
+  open file is checked with `fstat` for owner and mode. A failed check reads and
+  writes nothing and the stop proceeds without the drift comparison, disclosed
+  as NOT verified. Residual: another user can still deny the drift check by
+  creating the per-user directory first; on Windows the owner checks are
+  skipped and the per-user temp directory is the boundary.
 
 **Status:** [x] Documented in ground-truth; demo skeptic script in judge pass.
 

@@ -12,7 +12,7 @@
  *                          maps to stopHookActive to prevent recursive loops.
  */
 import { mkdir, readFile, unlink, writeFile } from 'node:fs/promises';
-import { join, resolve, sep } from 'node:path';
+import { resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import { createHash } from 'node:crypto';
 import type { Deps, Result, UsablConfig } from '../contracts/index.js';
@@ -23,6 +23,7 @@ import { checkGuard, computeSessionPins, diffSessionPins, type SessionPins } fro
 import { loadConfig } from '../cli.js';
 import { evaluateStopDecision, type HookContext } from './stop-hook.js';
 import { BYPASS_ONCE_PATH, loadReceipt, saveReceipt, type ReceiptFs } from './receipt-store.js';
+import { currentUid, makeFsSessionPinStore, sessionPinDir, type SessionPinStore } from './session-pin-store.js';
 
 export interface StopHookInput {
   stopHookActive: boolean;
@@ -35,7 +36,8 @@ export interface StopHookRunnerFs extends ReceiptFs {
 
 export interface StopHookRunnerPorts {
   fs: StopHookRunnerFs;
-  tmpDir: () => string;
+  // Where session pins are kept. The real one is private to the user; see session-pin-store.ts.
+  pins: SessionPinStore;
   cwd: () => string;
   stdoutWrite: (text: string) => Promise<void> | void;
   stderrWrite: (text: string) => Promise<void> | void;
@@ -67,7 +69,7 @@ function isSessionPins(value: unknown): value is SessionPins {
 }
 
 /**
- * Pin file location for one session in one repository.
+ * Pin file name for one session in one repository, inside the user's pin directory.
  *
  * The key includes the repository because the hook runs in the session's current working
  * directory, and that directory moves when the assistant changes directories. A session
@@ -77,11 +79,14 @@ function isSessionPins(value: unknown): value is SessionPins {
  * SHA-256 of the resolved working directory. Config is loaded from that directory, so it
  * is the repository root by construction.
  *
- * Pure: it derives a path and touches no filesystem.
+ * The user is bound by the directory, which carries the user id in its name: see
+ * sessionPinDir in session-pin-store.ts.
+ *
+ * Pure: it derives a name and touches no filesystem.
  */
-export function sessionPinPath(tmpDirPath: string, sessionId: string, cwd: string): string {
+export function sessionPinFileName(sessionId: string, cwd: string): string {
   const repoKey = createHash('sha256').update(resolve(cwd)).digest('hex').slice(0, 16);
-  return join(tmpDirPath, `usabl-pins-${sessionId}-${repoKey}.json`);
+  return `${sessionId}-${repoKey}.json`;
 }
 
 function parseSessionId(raw: string | null): { sessionId: string | null; warning: string | null } {
@@ -97,12 +102,6 @@ function parseSessionId(raw: string | null): { sessionId: string | null; warning
     };
   }
   return { sessionId: candidate, warning: null };
-}
-
-function isWithinDir(baseDir: string, path: string): boolean {
-  const resolvedBase = resolve(baseDir);
-  const resolvedPath = resolve(path);
-  return resolvedPath === resolvedBase || resolvedPath.startsWith(resolvedBase + sep);
 }
 
 async function writeStderr(ports: StopHookRunnerPorts, text: string): Promise<void> {
@@ -150,11 +149,7 @@ async function consumeBypassOnce(fs: StopHookRunnerFs): Promise<boolean> {
   return true;
 }
 
-async function readSessionPins(fs: StopHookRunnerFs, path: string): Promise<SessionPins | null> {
-  const raw = await fs.readFile(path);
-  if (raw === null) {
-    return null;
-  }
+function parseSessionPins(raw: string): SessionPins | null {
   try {
     const parsed: unknown = JSON.parse(raw);
     return isSessionPins(parsed) ? parsed : null;
@@ -163,8 +158,16 @@ async function readSessionPins(fs: StopHookRunnerFs, path: string): Promise<Sess
   }
 }
 
-async function writeSessionPins(fs: StopHookRunnerFs, path: string, pins: SessionPins): Promise<void> {
-  await fs.writeFile(path, JSON.stringify(pins, null, 2));
+// What the operator reads when the pin store refused. The stop goes on without the drift
+// comparison rather than blocking: a block here would trap the session behind a file another user
+// controls, which is the fail-open decision the threat model records for a wedged hook. It is
+// never silent, and nothing is read from or written to the refused location.
+function pinRefusalMessage(reason: string): string {
+  return (
+    `NOT verified - usabl did not use session pins for this stop because ${reason}. ` +
+    'Guarded policy drift during this session was not checked on this stop. Nothing was read ' +
+    'from or written to that location.'
+  );
 }
 
 async function verifyStoredReceipt(
@@ -219,10 +222,17 @@ function defaultFs(): StopHookRunnerFs {
   };
 }
 
-export function makeStopHookRunnerPorts(): StopHookRunnerPorts {
+export interface StopHookRunnerPortOptions {
+  // The user the session pins belong to. Absent means the user this process runs as. Tests set
+  // it to another id, because a test cannot chown a file to make it another user's.
+  uid?: number | null;
+}
+
+export function makeStopHookRunnerPorts(options: StopHookRunnerPortOptions = {}): StopHookRunnerPorts {
+  const uid = options.uid === undefined ? currentUid() : options.uid;
   return {
     fs: defaultFs(),
-    tmpDir: () => tmpdir(),
+    pins: makeFsSessionPinStore({ dir: sessionPinDir(tmpdir(), uid), uid }),
     cwd: () => process.cwd(),
     stdoutWrite: async (text: string) => {
       process.stdout.write(text);
@@ -291,17 +301,26 @@ export async function runStopHook(
       await writeStderr(ports, parsedSession.warning);
     }
     if (parsedSession.sessionId !== null) {
-      const pinsPath = sessionPinPath(ports.tmpDir(), parsedSession.sessionId, ports.cwd());
-      if (!isWithinDir(ports.tmpDir(), pinsPath)) {
-        await writeStderr(ports, `NOT verified - ignored unsafe session_id: ${JSON.stringify(parsedSession.sessionId)}.`);
+      const pinName = sessionPinFileName(parsedSession.sessionId, ports.cwd());
+      const stored = await ports.pins.read(pinName);
+      if (stored.status === 'refused') {
+        // Never read as "no pins yet": that is exactly what would adopt a planted file.
+        await writeStderr(ports, pinRefusalMessage(stored.reason));
       } else {
-        const [previousPins, nextPins] = await Promise.all([
-          readSessionPins(ports.fs, pinsPath),
-          computeSessionPins(deps, config),
-        ]);
+        const nextPins = await computeSessionPins(deps, config);
+        const previousPins = stored.status === 'found' ? parseSessionPins(stored.contents) : null;
+        const serialized = JSON.stringify(nextPins, null, 2);
 
         if (previousPins === null) {
-          await writeSessionPins(ports.fs, pinsPath, nextPins);
+          // No pins yet, or a private pin file of ours that does not parse. Either way this stop
+          // records the first pins for the session.
+          const written =
+            stored.status === 'missing'
+              ? await ports.pins.create(pinName, serialized)
+              : await ports.pins.replace(pinName, serialized);
+          if (written.status === 'refused') {
+            await writeStderr(ports, pinRefusalMessage(written.reason));
+          }
         } else {
           const drift = diffSessionPins(previousPins, nextPins);
           if (drift.length > 0) {
@@ -316,7 +335,10 @@ export async function runStopHook(
             await emitProtocolBlock(ports, message, options);
             return 0;
           }
-          await writeSessionPins(ports.fs, pinsPath, nextPins);
+          const written = await ports.pins.replace(pinName, serialized);
+          if (written.status === 'refused') {
+            await writeStderr(ports, pinRefusalMessage(written.reason));
+          }
         }
       }
     }

@@ -4,6 +4,7 @@ import { makeFakeDeps } from '../src/deps/fakes.js';
 import { run } from '../src/run.js';
 import { evaluateStopDecision } from '../src/surfaces/stop-hook.js';
 import { runStopHookFromStdin } from '../src/surfaces/stop-hook-runner.js';
+import { memoryPinStore } from './support/memory-pin-store.js';
 
 const config: UsablConfig = {
   appBaseUrl: 'http://127.0.0.1:5173',
@@ -165,7 +166,7 @@ describe('Stop hook blocks corrupt guarded policy', () => {
         mkdir: async () => {},
         unlink: async () => {},
       },
-      tmpDir: () => '/tmp',
+      pins: memoryPinStore(),
       cwd: () => '/repo/one',
       stdoutWrite: async (text) => {
         stdout.push(text);

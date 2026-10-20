@@ -436,6 +436,19 @@
 
 ### Security
 
+- Stop hook session pins are private to the user. They were kept in the shared
+  temp directory under predictable names with the process umask, and the hook
+  followed whatever was at the path, so another local user could precreate a
+  file or a symlink there to cause false drift blocks, poison the pins, slip a
+  later tamper past the check, or overwrite another file the victim can write.
+  Pins now live in a per-user directory, `usabl-pins-<uid>` under the temp
+  directory, created with mode 0700 and checked to be a real directory owned by
+  the user with no group or other permission bits. Pin files are created
+  exclusively with mode 0600, a symlink at the path is refused rather than
+  followed, and an open file is checked for owner and mode. A failed check reads
+  and writes nothing; the stop goes on without the drift comparison and says so
+  as NOT verified. Pins kept in the old location are no longer read, so the first
+  stop of a session after upgrading records fresh pins.
 - The pull request comment prints no number that is not a number. Sealing every
   string it carries left the numbers unsealed, and a document supplying a list
   as `{"length": "@user"}` put that text into the not-evaluated counts, because

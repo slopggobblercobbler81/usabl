@@ -1186,6 +1186,32 @@ from the resolved working directory the hook runs in, so pins recorded in one re
 are never compared against another. The stop hook checks pins mid-session to catch a
 committed tamper that git-status-clean cannot see.
 
+The temp dir is shared by every local user, so pins are kept private to the user:
+
+- They live in one directory per user, `usabl-pins-<uid>` under the temp dir, created
+  with mode 0700. The user id in the name binds the pins to the user. Before any read or
+  write the directory is checked with `lstat`: it must be a real directory, not a symlink,
+  owned by this user, with no permission bits for group or others.
+- A pin file, `<session id>-<repository key>.json`, is created exclusively (`O_CREAT` with
+  `O_EXCL`) with mode 0600, so a file that is already there is never adopted.
+- A pin file is opened with `O_NOFOLLOW` after an `lstat` check, so a symlink at the path
+  is refused, never followed. The open handle is then checked with `fstat`: a regular file,
+  owned by this user, with no permission bits for group or others.
+
+Any failed check refuses with a plain reason, reads nothing, and writes nothing. The stop
+then goes on without the drift comparison and says so on stderr (`NOT verified - usabl did
+not use session pins for this stop because ...`). It does not block, because a block would
+trap the session behind a file another user controls; this is the same fail-open choice as
+the exit 4 decision in the threat model. A refusal is never read as "no pins yet", which is
+what would let a planted file be adopted.
+
+What this does not cover. Another local user can still deny the drift check by creating
+`usabl-pins-<uid>` first: the check is then skipped on every stop, loudly. On Windows the
+platform reports no user id, so the directory has no id in its name and the owner checks are
+skipped; the per-user temp dir Windows gives each account is what keeps it private. The checks
+assume the temp dir only lets an entry's owner remove or rename it, which the sticky bit on
+`/tmp` provides.
+
 ### Receipt binding
 
 Four bindings are compared on re-verification:
@@ -1837,7 +1863,8 @@ self-check.
   are honest `not_covered`, never silent passes.
 - Identity-weak rules (missing accessible name) use count-based identity because you
   cannot honestly key an unnamed element by name.
-- Session pinning is best-effort (stored in temp dir, clearable by OS).
+- Session pinning is best-effort (stored in a private per-user temp dir, clearable by
+  the OS, and skipped with a disclosure when that dir is not private).
 
 ---
 

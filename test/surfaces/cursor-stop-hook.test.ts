@@ -10,6 +10,7 @@ import type { Deps, Result, UsablConfig } from '../../src/contracts/index.js';
 import { makeFakeDeps } from '../../src/deps/fakes.js';
 import { evaluateStopDecision } from '../../src/surfaces/stop-hook.js';
 import { runStopHookFromStdin } from '../../src/surfaces/stop-hook-runner.js';
+import { memoryPinStore } from '../support/memory-pin-store.js';
 
 const configFixture: UsablConfig = {
   appBaseUrl: 'http://127.0.0.1:5173',
@@ -78,7 +79,7 @@ function makePorts(overrides: {
     stderr,
     ports: {
       fs,
-      tmpDir: () => '/tmp',
+      pins: memoryPinStore(),
       cwd: () => '/repo/one',
       stdoutWrite: async (text: string) => {
         stdout.push(text);
